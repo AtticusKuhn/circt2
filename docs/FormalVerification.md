@@ -46,7 +46,35 @@ binary.
 
 ## Bounded Model Checking
 
-TODO
+The `circt-bmc` tool takes one MLIR input file with operations of the HW, Comb,
+and Seq dialects, along with operations from the Verif dialect to annotate the
+design with properties. The name of the top module is also taken as an argument,
+along with a bound indicating how many timesteps the design should be model
+checked over. Similarly to `circt-lec`, the problem can be emitted as LLVM IR
+for later compilation or can be passed to the LLVM JIT compiler and executed
+immediately (in which case the location of a Z3 library is also required). To
+get to know the exact CLI command type `circt-bmc --help`.
+
+An example of a file that can be provided to `circt-bmc` can be seen below:
+
+```mlir
+hw.module @MyModule(in %clk: !seq.clock, in %i0: i1) {
+  %c-1_i1 = hw.constant -1 : i1
+  %reg = seq.compreg %i0, %clk : i1
+  %not_reg = comb.xor bin %reg, %c-1_i1 : i1
+  %not_not_reg = comb.xor bin %not_reg, %c-1_i1 : i1
+  // Condition
+  %eq = comb.icmp bin eq %not_not_reg, %reg : i1
+  verif.assert %eq : i1
+}
+```
+
+This design negates a register's output twice and checks that the register's
+output is always equivalent to the double-negated value - this is specified with
+a `verif.assert` operation. Calling
+`circt-bmc -b 10 --module MyModule --shared-libs=<z3 library>` on this IR will
+emit `Bound reached with no violations!`, as the property holds over the 10
+cycles checked.
 
 ## Infrastructure Overview
 
@@ -55,7 +83,7 @@ building formal verification tools based on CIRCT. The
 [below diagram](/includes/img/smt_based_formal_verification_infra.svg) provides
 a visual overview.
 
-<p align="center"><img src="/includes/img/smt_based_formal_verification_infra.svg"/></p>
+<p align="center"><img src="https://circt.llvm.org/includes/img/smt_based_formal_verification_infra.svg"/></p>
 
 The overall flow will insert an explicit operation to specify the verification
 problem (e.g., `verif.lec`, `verif.bmc`). This operation could then be lowered

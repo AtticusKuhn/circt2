@@ -277,7 +277,9 @@ def FIFOOp : SeqOp<"fifo", [
     operations.
     The fifo operation is configurable with the following parameters:
     1. Depth (cycles)
-    2. Almost full/empty thresholds (optional). If not provided, these will
+    2. Read latency (cycles) is the number of cycles it takes for a read to
+       return data after the read enable signal is asserted.
+    3. Almost full/empty thresholds (optional). If not provided, these will
        be asserted when the FIFO is full/empty.
 
     Like `seq.hlmem` there are no guarantees that all possible fifo configuration
@@ -286,18 +288,21 @@ def FIFOOp : SeqOp<"fifo", [
   }];
 
   let arguments = (ins
-    HWIntegerType:$input, I1:$rdEn, I1:$wrEn, ClockType:$clk, I1:$rst,
+    AnyType:$input, I1:$rdEn, I1:$wrEn, ClockType:$clk, I1:$rst,
     ConfinedAttr<I64Attr, [IntMinValue<1>]>:$depth,
+    DefaultValuedOptionalAttr<ConfinedAttr<I64Attr, [IntMinValue<0>]>, "0">
+      :$rdLatency,
     OptionalAttr<ConfinedAttr<I64Attr, [IntMinValue<0>]>>:$almostFullThreshold,
     OptionalAttr<ConfinedAttr<I64Attr, [IntMinValue<0>]>>:$almostEmptyThreshold
   );
 
   let results = (outs
-    HWIntegerType:$output, I1:$full, I1:$empty, Optional<I1>:$almostFull,
+    AnyType:$output, I1:$full, I1:$empty, Optional<I1>:$almostFull,
     Optional<I1>:$almostEmpty);
 
   let assemblyFormat = [{
     `depth` $depth
+    (`rd_latency` $rdLatency^)?
     custom<FIFOAFThreshold>($almostFullThreshold, type($almostFull))
     custom<FIFOAEThreshold>($almostEmptyThreshold, type($almostEmpty))
     `in` $input `rdEn` $rdEn `wrEn` $wrEn `clk` $clk `rst` $rst attr-dict `:` type($input)
@@ -724,7 +729,7 @@ def InitialOp : SeqOp<"initial", [SingleBlock,
     See the Seq dialect rationale for a longer description.
   }];
 
-  let arguments = (ins);
+  let arguments = (ins Variadic<ImmutableType>: $inputs);
   let results = (outs Variadic<ImmutableType>); // seq.immutable values
   let regions = (region SizedRegion<1>:$body);
   let hasVerifier = 1;
@@ -734,7 +739,7 @@ def InitialOp : SeqOp<"initial", [SingleBlock,
   ];
 
   let assemblyFormat = [{
-    $body attr-dict `:` type(results)
+    `(` $inputs `)` $body attr-dict `:` functional-type($inputs, results)
   }];
 
   let extraClassDeclaration = [{
@@ -752,4 +757,13 @@ def YieldOp : SeqOp<"yield",
   ];
 
   let assemblyFormat = "attr-dict ($operands^ `:` type($operands))?";
+}
+
+def FromImmutableOp : SeqOp<"from_immutable", [Pure]> {
+  let summary = "Cast from an immutable type to a wire type";
+
+  let arguments = (ins ImmutableType:$input);
+  let results = (outs AnyType:$output);
+
+  let assemblyFormat = "$input attr-dict `:` functional-type(operands, results)";
 }

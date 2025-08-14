@@ -206,9 +206,11 @@ static cl::list<std::string> inputAnnotationFilenames(
     "annotation-file", cl::desc("Optional input annotation file"),
     cl::CommaSeparated, cl::value_desc("filename"), cl::cat(mainCategory));
 
-static cl::list<std::string> inputOMIRFilenames(
-    "omir-file", cl::desc("Optional input object model 2.0 file"),
-    cl::CommaSeparated, cl::value_desc("filename"), cl::cat(mainCategory));
+static cl::opt<std::string>
+    hwOutFile("output-hw-mlir",
+              cl::desc("Optional file name to output the HW IR into, in "
+                       "addition to the output requested by -o"),
+              cl::init(""), cl::value_desc("filename"), cl::cat(mainCategory));
 
 static cl::opt<std::string>
     mlirOutFile("output-final-mlir",
@@ -279,6 +281,13 @@ static llvm::cl::opt<LayerSpecializationOpt> defaultLayerSpecialization{
                    "Layers are enabled")),
     cl::init(LayerSpecializationOpt::None), cl::cat(mainCategory)};
 
+/// Specify the select option for specializing instance choice. Currently
+/// firtool does not support partially specified instance choice.
+static cl::list<std::string> selectInstanceChoice(
+    "select-instance-choice",
+    cl::desc("Options to specialize instance choice, in option=case format"),
+    cl::MiscFlags::CommaSeparated, cl::cat(mainCategory));
+
 /// Check output stream before writing bytecode to it.
 /// Warn and return true if output is known to be displayed.
 static bool checkBytecodeOutputToConsole(raw_ostream &os) {
@@ -333,6 +342,38 @@ struct EmitSplitHGLDDPass
   }
 };
 
+/// Wrapper pass to dump IR.
+struct DumpIRPass
+    : public PassWrapper<DumpIRPass, OperationPass<mlir::ModuleOp>> {
+  DumpIRPass(const std::string &outputFile)
+      : PassWrapper<DumpIRPass, OperationPass<mlir::ModuleOp>>() {
+    this->outputFile.setValue(outputFile);
+  }
+
+  DumpIRPass(const DumpIRPass &other) : PassWrapper(other) {
+    outputFile.setValue(other.outputFile.getValue());
+  }
+
+  void runOnOperation() override {
+    assert(!outputFile.empty());
+
+    std::string error;
+    auto mlirFile = openOutputFile(outputFile.getValue(), &error);
+    if (!mlirFile) {
+      errs() << error;
+      return signalPassFailure();
+    }
+
+    if (failed(printOp(getOperation(), mlirFile->os())))
+      return signalPassFailure();
+    mlirFile->keep();
+    markAllAnalysesPreserved();
+  }
+
+  Pass::Option<std::string> outputFile{*this, "output-file",
+                                       cl::desc("filename"), cl::init("-")};
+};
+
 /// Process a single buffer of the input.
 static LogicalResult processBuffer(
     MLIRContext &context, firtool::FirtoolOptions &firtoolOptions,
@@ -351,15 +392,6 @@ static LogicalResult processBuffer(
       return failure();
     }
     ++numAnnotationFiles;
-  }
-
-  for (const auto &file : inputOMIRFilenames) {
-    std::string filename;
-    if (!sourceMgr.AddIncludeFile(file, llvm::SMLoc(), filename)) {
-      llvm::errs() << "cannot open input annotation file '" << file
-                   << "': No such file or directory\n";
-      return failure();
-    }
   }
 
   // Parse the input.
@@ -383,6 +415,7 @@ static LogicalResult processBuffer(
     options.scalarizeExtModules = scalarizeExtModules;
     options.enableLayers = enableLayers;
     options.disableLayers = disableLayers;
+    options.selectInstanceChoice = selectInstanceChoice;
 
     switch (defaultLayerSpecialization) {
     case LayerSpecializationOpt::None:
@@ -461,6 +494,11 @@ static LogicalResult processBuffer(
       if (failed(firtool::populateHWToBTOR2(pm, firtoolOptions,
                                             (*outputFile)->os())))
         return failure();
+
+    // If requested, emit the HW IR to hwOutFile.
+    if (!hwOutFile.empty())
+      pm.addPass(std::make_unique<DumpIRPass>(hwOutFile.getValue()));
+
     if (outputFormat != OutputIRHW)
       if (failed(firtool::populateHWToSV(pm, firtoolOptions)))
         return failure();
@@ -509,11 +547,15 @@ static LogicalResult processBuffer(
       break;
     }
 
-    // Run final IR mutations to clean it up after ExportVerilog and before
-    // emitting the final MLIR.
-    if (!mlirOutFile.empty())
+    // If requested, print the final MLIR into mlirOutFile.
+    if (!mlirOutFile.empty()) {
+      // Run final IR mutations to clean it up after ExportVerilog and before
+      // emitting the final MLIR.
       if (failed(firtool::populateFinalizeIR(pm, firtoolOptions)))
         return failure();
+
+      pm.addPass(std::make_unique<DumpIRPass>(mlirOutFile.getValue()));
+    }
   }
 
   if (failed(pm.run(module.get())))
@@ -524,20 +566,6 @@ static LogicalResult processBuffer(
     auto outputTimer = ts.nest("Print .mlir output");
     if (failed(printOp(*module, (*outputFile)->os())))
       return failure();
-  }
-
-  // If requested, print the final MLIR into mlirOutFile.
-  if (!mlirOutFile.empty()) {
-    std::string mlirOutError;
-    auto mlirFile = openOutputFile(mlirOutFile, &mlirOutError);
-    if (!mlirFile) {
-      llvm::errs() << mlirOutError;
-      return failure();
-    }
-
-    if (failed(printOp(*module, mlirFile->os())))
-      return failure();
-    mlirFile->keep();
   }
 
   // We intentionally "leak" the Module into the MLIRContext instead of

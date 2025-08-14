@@ -36,6 +36,11 @@ class ResultIsSingleBitMatchingInputDomain<string result, string input> :
       llvm::cast<UnpackedType>($_self).getDomain())
   }]>;
 
+class TypeDomainsMatch<list<string> values> :
+  AllMatchSameOperatorTrait<values, [{
+    cast<moore::UnpackedType>($_self.getType()).getDomain()
+  }], "domain">;
+
 //===----------------------------------------------------------------------===//
 // Structure
 //===----------------------------------------------------------------------===//
@@ -385,7 +390,6 @@ def EdgeAttr: I32EnumAttr<"Edge", "Edge kind",
 }
 
 def WaitEventOp : MooreOp<"wait_event", [
-  RecursiveMemoryEffects,
   NoRegionArguments,
   SingleBlock,
   NoTerminator
@@ -484,7 +488,7 @@ def ConstantOp : MooreOp<"constant", [Pure, ConstantLike]> {
   let builders = [
     OpBuilder<(ins "IntType":$type, "const FVInt &":$value)>,
     OpBuilder<(ins "IntType":$type, "const APInt &":$value)>,
-    OpBuilder<(ins "IntType":$type, "int64_t":$value)>,
+    OpBuilder<(ins "IntType":$type, "int64_t":$value, CArg<"bool", "true">:$isSigned)>,
   ];
 }
 
@@ -503,8 +507,25 @@ def StringConstantOp : MooreOp<"string_constant", [Pure]> {
   let assemblyFormat = "$value attr-dict `:` type($result)";
 }
 
+def RealLiteralOp : MooreOp<"real_constant", [Pure]> {
+  let summary = "Produce a constant real value";
+  let description = [{
+    Produces a constant value of real type.
+    
+    Example:
+    ```mlir
+    %0 = moore.real_constant 1.23
+    ```
+    The real type has fixed-point(1.2) and exponent(2.0e10) formats.
+    See IEEE 1800-2017 § 5.7.2 "Real literal constants".
+  }];
+  let arguments = (ins F64Attr:$value);
+  let results = (outs RealType:$result);
+  let assemblyFormat = "$value attr-dict `:` type($result)";
+}
+
 //===----------------------------------------------------------------------===//
-// Expressions
+// Casting and Resizing
 //===----------------------------------------------------------------------===//
 
 def ConversionOp : MooreOp<"conversion", [Pure]> {
@@ -537,6 +558,61 @@ def ConversionOp : MooreOp<"conversion", [Pure]> {
   }];
   let hasFolder = 1;
 }
+
+def TruncOp : MooreOp<"trunc", [
+  Pure,
+  TypeDomainsMatch<["input", "result"]>,
+  PredOpTrait<"result width must be smaller than input width", CPred<[{
+    cast<moore::IntType>($result.getType()).getBitSize() <
+      cast<moore::IntType>($input.getType()).getBitSize()
+  }]>>,
+]> {
+  let summary = "Truncate a value";
+  let description = [{
+    Reduce the bit width of a value by removing some of its most significant
+    bits. This can only change the bit width of an integer type.
+  }];
+  let arguments = (ins IntType:$input);
+  let results = (outs IntType:$result);
+  let assemblyFormat = [{
+    $input attr-dict `:` type($input) `->` type($result)
+  }];
+}
+
+class ExtOpBase<string mnemonic> : MooreOp<mnemonic, [
+  Pure,
+  TypeDomainsMatch<["input", "result"]>,
+  PredOpTrait<"result width must be larger than input width", CPred<[{
+    cast<moore::IntType>($result.getType()).getBitSize() >
+      cast<moore::IntType>($input.getType()).getBitSize()
+  }]>>,
+]> {
+  let arguments = (ins IntType:$input);
+  let results = (outs IntType:$result);
+  let assemblyFormat = [{
+    $input attr-dict `:` type($input) `->` type($result)
+  }];
+}
+
+def ZExtOp : ExtOpBase<"zext"> {
+  let summary = "Zero-extend a value";
+  let description = [{
+    Increase the bit width of a value by inserting additional zero most
+    significant bits. This keeps the unsigned value constant.
+  }];
+}
+
+def SExtOp : ExtOpBase<"sext"> {
+  let summary = "Sign-extend a value";
+  let description = [{
+    Increase the bit width of a value by replicating its most significant bit.
+    This keeps the signed value constant.
+  }];
+}
+
+//===----------------------------------------------------------------------===//
+// Expressions
+//===----------------------------------------------------------------------===//
 
 def NegOp : MooreOp<"neg", [Pure, SameOperandsAndResultType]> {
   let summary = "Arithmetic negation";
@@ -648,6 +724,8 @@ def SubOp : BinaryOpBase<"sub"> {
 
     See IEEE 1800-2017 § 11.4.3 "Arithmetic operators".
   }];
+
+  let hasFolder = 1;
 }
 
 def MulOp : BinaryOpBase<"mul", [Commutative]> {
@@ -1548,6 +1626,20 @@ def SeverityBIOp : Builtin<"severity"> {
 // Math Builtins
 //===----------------------------------------------------------------------===//
 
+class RealMathFunc<string mnemonic, list<Trait> traits = []> : 
+    Builtin<mnemonic, traits # [SameOperandsAndResultType]> {
+  let description = [{
+    The system real math functions shall accept real value arguments and return
+    a real result type. Their behavior shall match the equivalent C language
+    standard math library function indicated.
+
+    See IEEE 1800-2017 § 20.8.2 "Real math functions".
+   }];
+  let arguments = (ins RealType:$value);
+  let results = (outs RealType:$result);
+  let assemblyFormat = "$value attr-dict `:` type($value)";
+}
+
 def Clog2BIOp : Builtin<"clog2", [SameOperandsAndResultType]> {
   let summary = "Compute ceil(log2(x)) of x";
   let description = [{
@@ -1564,6 +1656,78 @@ def Clog2BIOp : Builtin<"clog2", [SameOperandsAndResultType]> {
   let arguments = (ins IntType:$value);
   let results = (outs IntType:$result);
   let assemblyFormat = "$value attr-dict `:` type($value)";
+}
+
+def LnBIOp : RealMathFunc<"ln"> {
+  let summary = "Natural logarithm";
+}
+
+def Log10BIOp : RealMathFunc<"log10"> {
+  let summary = "Decimal logarithm";
+}
+
+def ExpBIOp : RealMathFunc<"exp"> {
+  let summary = "Exponential";
+}
+
+def SqrtBIOp : RealMathFunc<"sqrt"> {
+  let summary = "Square root";
+}
+
+def FloorBIOp : RealMathFunc<"floor"> {
+  let summary = "Floor";
+}
+
+def CeilBIOp : RealMathFunc<"ceil"> {
+  let summary = "Ceiling";
+}
+
+def SinBIOp : RealMathFunc<"sin"> {
+  let summary = "Sine";
+}
+
+def CosBIOp : RealMathFunc<"cos"> {
+  let summary = "Cosine";
+}
+
+def TanBIOp : RealMathFunc<"tan"> {
+  let summary = "Tangent";
+}
+
+def AsinBIOp : RealMathFunc<"asin"> {
+  let summary = "Arc-sine";
+}
+
+def AcosBIOp : RealMathFunc<"acos"> {
+  let summary = "Arc-cosine";
+}
+
+def AtanBIOp : RealMathFunc<"atan"> {
+  let summary = "Arc-tangent";
+}
+
+def SinhBIOp : RealMathFunc<"sinh"> {
+  let summary = "Hyperbolic sine";
+}
+
+def CoshBIOp : RealMathFunc<"cosh"> {
+  let summary = "Hyperbolic cosine";
+}
+
+def TanhBIOp : RealMathFunc<"tanh"> {
+  let summary = "Hyperbolic tangent";
+}
+
+def AsinhBIOp : RealMathFunc<"asinh"> {
+  let summary = "Arc-hyperbolic sine";
+}
+
+def AcoshBIOp : RealMathFunc<"acosh"> {
+  let summary = "Arc-hyperbolic cosine";
+}
+
+def AtanhBIOp : RealMathFunc<"atanh"> {
+  let summary = "Arc-hyperbolic tangent";
 }
 
 #endif // CIRCT_DIALECT_MOORE_MOOREOPS

@@ -23,6 +23,7 @@
 
 #include "esi/Context.h"
 #include "esi/Design.h"
+#include "esi/Engines.h"
 #include "esi/Manifest.h"
 #include "esi/Ports.h"
 #include "esi/Services.h"
@@ -85,10 +86,12 @@ public:
   /// Disconnect from the accelerator cleanly.
   virtual void disconnect();
 
-  /// Request the host side channel ports for a particular instance (identified
-  /// by the AppID path). For convenience, provide the bundle type.
-  virtual std::map<std::string, ChannelPort &>
-  requestChannelsFor(AppIDPath, const BundleType *) = 0;
+  // While building the design, keep around a std::map of active services
+  // indexed by the service name. When a new service is encountered during
+  // descent, add it to the table (perhaps overwriting one). Modifications to
+  // the table only apply to the current branch, so copy this and update it at
+  // each level of the tree.
+  using ServiceTable = std::map<std::string, services::Service *>;
 
   /// Return a pointer to the accelerator 'service' thread (or threads). If the
   /// thread(s) are not running, they will be started when this method is
@@ -119,7 +122,23 @@ public:
   /// accelerator to this connection. Returns a raw pointer to the object.
   Accelerator *takeOwnership(std::unique_ptr<Accelerator> accel);
 
+  /// Create a new engine for channel communication with the accelerator. The
+  /// default is to call the global `createEngine` to get an engine which has
+  /// registered itself. Individual accelerator connection backends can override
+  /// this to customize behavior.
+  virtual void createEngine(const std::string &engineTypeName, AppIDPath idPath,
+                            const ServiceImplDetails &details,
+                            const HWClientDetails &clients);
+  virtual const BundleEngineMap &getEngineMapFor(AppIDPath id) {
+    return clientEngines[id];
+  }
+
 protected:
+  /// If `createEngine` is overridden, this method should be called to register
+  /// the engine and all of the channels it services.
+  void registerEngine(AppIDPath idPath, std::unique_ptr<Engine> engine,
+                      const HWClientDetails &clients);
+
   /// Called by `getServiceImpl` exclusively. It wraps the pointer returned by
   /// this in a unique_ptr and caches it. Separate this from the
   /// wrapping/caching since wrapping/caching is an implementation detail.
@@ -127,6 +146,11 @@ protected:
                                  std::string implName,
                                  const ServiceImplDetails &details,
                                  const HWClientDetails &clients) = 0;
+
+  /// Collection of owned engines.
+  std::map<AppIDPath, std::unique_ptr<Engine>> ownedEngines;
+  /// Mapping of clients to their servicing engines.
+  std::map<AppIDPath, BundleEngineMap> clientEngines;
 
 private:
   /// ESI accelerator context.

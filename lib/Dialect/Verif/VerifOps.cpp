@@ -94,41 +94,6 @@ LogicalResult CoverOp::canonicalize(CoverOp op, PatternRewriter &rewriter) {
 }
 
 //===----------------------------------------------------------------------===//
-// Formal contract verifiers
-//===----------------------------------------------------------------------===//
-
-LogicalResult ContractOp::verifyRegions() {
-  // Retrieve the number of inputs from the parent module
-  auto parent = (*this)->getParentOfType<hw::HWModuleOp>();
-  // Sanity check: parent should always be a hw.module
-  if (!parent)
-    return emitOpError() << "parent of contract must be an hw.module!";
-
-  auto nRes = (*this)->getNumResults();
-  auto resTypes = (*this)->getResultTypes();
-  auto *yield = getBody().front().getTerminator();
-
-  // Check that the region terminator yields the same number of ops as the
-  // number of results
-  if (yield->getNumOperands() != nRes)
-    return emitOpError() << "region terminator must yield the same number of "
-                         << "operands as there are results!";
-
-  // Check that the region terminator yields the same types of ops as the
-  // types of results
-  if (yield->getOperandTypes() != resTypes)
-    return emitOpError() << "region terminator must yield the same types of "
-                         << "operands as the result types!";
-
-  // Check that the region block arguments share the same types as the results
-  if (getBody().front().getArgumentTypes() != resTypes)
-    return emitOpError() << "region must have the same type of arguments "
-                         << "as the type of results!";
-
-  return success();
-}
-
-//===----------------------------------------------------------------------===//
 // LogicalEquivalenceCheckingOp
 //===----------------------------------------------------------------------===//
 
@@ -178,7 +143,51 @@ LogicalResult BoundedModelCheckingOp::verifyRegions() {
                 "there are clock arguments in the circuit region "
                 "before any other values";
   }
+  if (getNumRegs() > 0 && totalClocks == 0)
+    return emitOpError("num_regs is non-zero, but the circuit region has no "
+                       "clock inputs to clock the registers");
+  auto initialValues = getInitialValues();
+  if (initialValues.size() != getNumRegs()) {
+    return emitOpError()
+           << "number of initial values must match the number of registers";
+  }
+  for (auto attr : initialValues) {
+    if (!isa<IntegerAttr, UnitAttr>(attr))
+      return emitOpError()
+             << "initial values must be integer or unit attributes";
+  }
   return success();
+}
+
+//===----------------------------------------------------------------------===//
+// SimulationOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult SimulationOp::verifyRegions() {
+  if (getBody()->getNumArguments() != 2)
+    return emitOpError() << "must have two block arguments";
+  if (!isa<seq::ClockType>(getBody()->getArgument(0).getType()))
+    return emitOpError() << "block argument #0 must be of type `!seq.clock`";
+  if (!getBody()->getArgument(1).getType().isSignlessInteger(1))
+    return emitOpError() << "block argument #1 must be of type `i1`";
+
+  auto *yieldOp = getBody()->getTerminator();
+  if (yieldOp->getNumOperands() != 2)
+    return yieldOp->emitOpError() << "must have two operands";
+  if (!yieldOp->getOperand(0).getType().isSignlessInteger(1))
+    return yieldOp->emitOpError() << "operand #0 must be of type `i1`";
+  if (!yieldOp->getOperand(1).getType().isSignlessInteger(1))
+    return yieldOp->emitOpError() << "operand #1 must be of type `i1`";
+
+  return success();
+}
+
+void SimulationOp::getAsmBlockArgumentNames(Region &region,
+                                            OpAsmSetValueNameFn setNameFn) {
+  if (region.empty() || region.getNumArguments() != 2)
+    return;
+  setNameFn(region.getArgument(0), "clock");
+  setNameFn(region.getArgument(1), "init");
 }
 
 //===----------------------------------------------------------------------===//

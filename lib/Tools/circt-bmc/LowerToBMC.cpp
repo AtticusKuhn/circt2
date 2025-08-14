@@ -12,8 +12,10 @@
 #include "circt/Dialect/Seq/SeqOps.h"
 #include "circt/Dialect/Seq/SeqTypes.h"
 #include "circt/Dialect/Verif/VerifOps.h"
+#include "circt/Support/LLVM.h"
 #include "circt/Support/Namespace.h"
 #include "circt/Tools/circt-bmc/Passes.h"
+#include "mlir/Analysis/TopologicalSortUtils.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/FunctionCallUtils.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -59,6 +61,11 @@ void LowerToBMCPass::runOnOperation() {
     return signalPassFailure();
   }
 
+  if (!sortTopologically(&hwModule.getBodyRegion().front())) {
+    hwModule->emitError("could not resolve cycles in module");
+    return signalPassFailure();
+  }
+
   // Create necessary function declarations and globals
   auto *ctx = &getContext();
   OpBuilder builder(ctx);
@@ -70,6 +77,10 @@ void LowerToBMCPass::runOnOperation() {
   // Lookup or declare printf function.
   auto printfFunc =
       LLVM::lookupOrCreateFn(moduleOp, "printf", ptrTy, voidTy, true);
+  if (failed(printfFunc)) {
+    moduleOp->emitError("failed to lookup or create printf");
+    return signalPassFailure();
+  }
 
   // Replace the top-module with a function performing the BMC
   auto entryFunc = builder.create<func::FuncOp>(
@@ -87,13 +98,23 @@ void LowerToBMCPass::runOnOperation() {
   // Double the bound given to the BMC op, as a clock cycle takes 2 BMC
   // iterations
   verif::BoundedModelCheckingOp bmcOp;
-  if (auto numRegs = hwModule->getAttrOfType<IntegerAttr>("num_regs"))
+  auto numRegs = hwModule->getAttrOfType<IntegerAttr>("num_regs");
+  auto initialValues = hwModule->getAttrOfType<ArrayAttr>("initial_values");
+  if (numRegs && initialValues) {
+    for (auto value : initialValues) {
+      if (!isa<IntegerAttr, UnitAttr>(value)) {
+        hwModule->emitError("initial_values attribute must contain only "
+                            "integer or unit attributes");
+        return signalPassFailure();
+      }
+    }
     bmcOp = builder.create<verif::BoundedModelCheckingOp>(
-        loc, 2 * bound, cast<IntegerAttr>(numRegs).getValue().getZExtValue());
-  else {
-    hwModule->emitOpError(
-        "no num_regs attribute found - please run externalize "
-        "registers pass first");
+        loc, 2 * bound, cast<IntegerAttr>(numRegs).getValue().getZExtValue(),
+        initialValues);
+  } else {
+    hwModule->emitOpError("no num_regs or initial_values attribute found - "
+                          "please run externalize "
+                          "registers pass first");
     return signalPassFailure();
   }
 
@@ -186,7 +207,8 @@ void LowerToBMCPass::runOnOperation() {
 
   auto formatString = builder.create<LLVM::SelectOp>(
       loc, bmcOp.getResult(), successStrAddr.value(), failureStrAddr.value());
-  builder.create<LLVM::CallOp>(loc, printfFunc, ValueRange{formatString});
+  builder.create<LLVM::CallOp>(loc, printfFunc.value(),
+                               ValueRange{formatString});
   builder.create<func::ReturnOp>(loc);
 
   if (insertMainFunc) {

@@ -9,15 +9,18 @@
 #ifndef CIRCT_DIALECT_VERIF_VERIFOPS_TD
 #define CIRCT_DIALECT_VERIF_VERIFOPS_TD
 
-include "circt/Dialect/Verif/VerifDialect.td"
+include "circt/Dialect/HW/HWAttributes.td"
+include "circt/Dialect/HW/HWTypes.td"
 include "circt/Dialect/LTL/LTLDialect.td"
 include "circt/Dialect/LTL/LTLTypes.td"
-include "circt/Dialect/HW/HWTypes.td"
-include "circt/Dialect/HW/HWAttributes.td"
+include "circt/Dialect/Seq/SeqTypes.td"
+include "circt/Dialect/Verif/VerifDialect.td"
+include "circt/Dialect/Verif/VerifOpInterfaces.td"
 include "mlir/Interfaces/InferTypeOpInterface.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 include "mlir/IR/AttrTypeBase.td"
 include "mlir/IR/EnumAttr.td"
+include "mlir/IR/OpAsmInterface.td"
 include "mlir/IR/PatternBase.td"
 include "mlir/IR/RegionKindInterface.td"
 include "mlir/IR/SymbolInterfaces.td"
@@ -181,10 +184,12 @@ def BoundedModelCheckingOp : VerifOp<"bmc", [
     This operation represents a bounded model checking problem explicitly in
     the IR. The `bound` attribute indicates how many times the `circuit` region
     should be executed, and `num_regs` indicates the number of registers in the
-    design that have been externalised and appended to the region's
+    design that have been externalized and appended to the region's
     inputs/outputs (these values are fed from each `circuit` region execution
     to the next, as they represent register state, rather than being
-    overwritten with fresh variables like other inputs). The `circuit` region
+    overwritten with fresh variables like other inputs). `initial_values` is an
+    array containing the initial value of each register - where the register
+    has no initial value, a unit attribute is given. The `circuit` region
     contains the circuit (alongside the `verif` property checking operations)
     to be checked.
 
@@ -203,7 +208,8 @@ def BoundedModelCheckingOp : VerifOp<"bmc", [
     match the types yielded by the `init` region).
   }];
 
-  let arguments = (ins I32Attr:$bound, I32Attr:$num_regs);
+  // TODO: initial values should eventually be handled by init region
+  let arguments = (ins I32Attr:$bound, I32Attr:$num_regs, ArrayAttr:$initial_values);
   let regions = (region SizedRegion<1>:$init,
                         SizedRegion<1>:$loop,
                         SizedRegion<1>:$circuit);
@@ -211,7 +217,7 @@ def BoundedModelCheckingOp : VerifOp<"bmc", [
   let results = (outs I1:$result);
 
   let assemblyFormat = [{
-    `bound` $bound `num_regs` $num_regs attr-dict-with-keyword `init` $init `loop` $loop `circuit`
+    `bound` $bound `num_regs` $num_regs `initial_values` $initial_values attr-dict-with-keyword `init` $init `loop` $loop `circuit`
     $circuit
   }];
 
@@ -250,8 +256,9 @@ def LogicEquivalenceCheckingOp : VerifOp<"lec", [
 def YieldOp : VerifOp<"yield", [
   Terminator,
   ParentOneOf<[
-    "verif::LogicEquivalenceCheckingOp", "verif::BoundedModelCheckingOp",
-    "verif::ContractOp"
+    "verif::BoundedModelCheckingOp",
+    "verif::LogicEquivalenceCheckingOp",
+    "verif::SimulationOp",
   ]>
 ]> {
   let summary = "yields values from a region";
@@ -267,207 +274,271 @@ def YieldOp : VerifOp<"yield", [
 }
 
 //===----------------------------------------------------------------------===//
-// Verification intent ops
+// Verification Entry Points
 //===----------------------------------------------------------------------===//
 
 def FormalOp : VerifOp<"formal", [
-  NoTerminator, RegionKindInterface, HasParent<"mlir::ModuleOp">, 
-  IsolatedFromAbove, Symbol
+  IsolatedFromAbove,
+  NoRegionArguments,
+  NoTerminator,
+  RegionKindInterface,
+  SingleBlock,
+  Symbol,
 ]> {
-  let summary = "defines a formal verification test";
+  let summary = "A formal unit test";
   let description = [{
-    This operation defines a formal verification test. This should be written 
-    by declaring symbolic values that are then connected to a hardware instance. 
-    These symbols can then be used in additional assertions that are defined 
-    outside of the instantiated `hw.module` but inside of this region. 
-    Assertions/Assumptions defined within the instantiated module will also be 
-    used for verification. The region can then be converted into btor2, 
-    SystemVerilog, or used for verification directly in circt-bmc. The operations 
-    in this region are ignored during regular SystemVerilog emission. This allows 
-    for verification specific logic to be isolated from the design in a way that 
-    is similar to layers.   
-      
-    The attribute `k` defines the upper bound of cycles to check for this test 
-    w.r.t. the implicit clock defined by this operation within its region.
+    This operation defines a formal unit test that can be automatically run by
+    various tools. To describe a test, the body of this op should contain the
+    hardware to be tested, alongside any asserts, assumes, and covers to be
+    formally verified. The body can contain instances of other modules, in which
+    case all asserts, assumes, and covers in those modules are also verified.
+
+    The `verif.symbolic_value` op can be used to create symbolic values to feed
+    into the hardware to be tested. Testing tools will then try to find concrete
+    values for them that violate any asserts or make any covers true.
+
+    ### Example
+    ```
+    verif.formal @AdderTest {myParam = 42, myTag = "hello"} {
+      %0 = verif.symbolic_value : i42
+      %1 = verif.symbolic_value : i42
+      %2 = hw.instance "dut" @Adder(a: %0: i42, b: %1: i42) -> (c: i42)
+      %3 = comb.add %0, %1 : i42
+      %4 = comb.icmp eq %2, %3 : i42
+      verif.assert %4 : i1
+    }
+    ```
+
+    ### Parameters
+    The following parameters have a predefined meaning and are interpreted by
+    tools such as `circt-test` to guide execution of tests:
+
+    - `ignore`: Indicates whether the test should be ignored and skipped. This
+      can be useful for temporarily disabling tests without having to remove
+      them from the input. Must be a _boolean_ value.
+      ```mlir
+      verif.formal @Foo {ignore = true}
+      ```
+
+    - `require_runners`: A list of test runners that may be used to execute this
+      test. This option may be used to force a test to run using one of a few
+      known-good runners, acting like a whitelist. Must be an _array_ of
+      _strings_.
+      ```mlir
+      verif.formal @Foo {require_runners = ["sby", "circt-bmc"]}
+      ```
+
+    - `exclude_runners`: A list of test runners that must not be used to execute
+      this test. This option may be used to exclude a few known-bad runners from
+      executing this test, acting like a blacklist. Must be an _array_ of
+      _strings_.
+      ```mlir
+      verif.formal @Foo {exclude_runners = ["sby", "circt-bmc"]}
+      ```
   }];
-
-  let arguments = (ins SymbolNameAttr:$sym_name, APIntAttr:$k);
-
-  let regions = (region SizedRegion<1>:$test_region);
-
-  let assemblyFormat = [{
-    $sym_name `(``k` `=` $k `)` attr-dict-with-keyword
-    $test_region
-  }];
-
+  let arguments = (ins
+    SymbolNameAttr:$sym_name,
+    DictionaryAttr:$parameters
+  );
+  let regions = (region SizedRegion<1>:$body);
+  let assemblyFormat = "$sym_name $parameters attr-dict-with-keyword $body";
   let extraClassDeclaration = [{
-    /// Implement RegionKindInterface.
     static RegionKind getRegionKind(unsigned index) { 
       return RegionKind::Graph;
     }
   }];
 }
 
-//===----------------------------------------------------------------------===//
-// Formal Verification Ops
-//===----------------------------------------------------------------------===//
-
-def SymbolicInputOp : VerifOp<"symbolic_input", [
-  ParentOneOf<["verif::FormalOp"]>
-]>{
-  let summary = "declare a symbolic input for formal verification";
+def SimulationOp : VerifOp<"simulation", [
+  DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmBlockArgumentNames"]>,
+  IsolatedFromAbove,
+  RegionKindInterface,
+  SingleBlockImplicitTerminator<"verif::YieldOp">,
+  Symbol,
+]> {
+  let summary = "A simulation unit test";
   let description = [{
-    This operation declares a symbolic input that can then be used to reason 
-    about `hw.instance` inputs in a symbolic manner in assertions and 
-    assumptions. The result type must be explicitly marked. The resulting value 
-    is a new non-deterministic value for every clock cycle of the implicit clock 
-    defined by the parent `verif.formal`.  
-  }];
-  let results = (outs AnyType:$result);
+    This operation defines a simulation unit test that can be automatically run
+    by various tools. To describe a test, the body of this op should contain the
+    hardware to be tested, alongside any necessary forms of stimulus generation.
 
+    ### Inputs
+
+    The body has two block arguments as input values: a "clock" signal of type
+    `!seq.clock` and an "init" signal of type `i1`. The clock signal starts at 0
+    and continuously toggles between 0 and 1 throughout the simulation. The init
+    signal starts at 1, remains 1 during a single 0-to-1 transition of the
+    clock, and then drops to 0 for the remainder of the simulation.
+
+    ### Outputs
+
+    The body must have a `verif.yield` terminator op with exactly two operands:
+
+    The first operand is a "done" signal of type `i1` which indicates the end of
+    the simulation. The simulation stops when the done signal is 1 during a
+    0-to-1 transition of the clock after the init signal has dropped to 0. No
+    additional clock toggles occur once done has been sampled as 1.
+
+    The second operand is a "success" signal of type `i1` which indicates the
+    success of a test as 1, or failure as 0. The signal is sampled at the same
+    time as the done signal. Simulators must signal failure to the operating
+    system through a non-zero exit code.
+
+    ### Schedule
+
+    The clock and init values adhere to the following schedule during
+    simulation:
+
+    | Time      | Clock | Init  | Comment
+    |-----------|-------|-------| ----
+    | t0 (>=0s) | undef | undef | Clock and init may initially be undefined.
+    | t1 (>=t0) | 0     | 1     | Initialization code (e.g., `seq.initial`, Verilog `initial` procedures) may run before or after clock and init change to their initial value.
+    | t2 (>t1)  | 1     | 1     | Single rising clock edge occurs while init is high.
+    | t3 (>t2)  | 0     | 1     | Init may stay during the falling clock edge.
+    | t4 (>=t3) | 0     | 0     | Init goes to 0 before second rising clock edge.
+    | t5 (>t4)  | 1     | 0     | Clock toggles continue indefinitely.
+    | t6 (>t5)  | 0     | 0     |
+
+    Simulation termination occurs when the done signal is 1 during a 0-to-1
+    transition of the clock.
+
+    ### Example
+    ```
+    verif.simulation @AdderTest {myParam = 42, myTag = "hello"} {
+    ^bb0(%clock: !seq.clock, %init: i1):
+      // Count the first 9001 simulation cycles.
+      %c0_i19 = hw.constant 0 : i19
+      %c1_i19 = hw.constant 1 : i19
+      %c9001_i19 = hw.constant 9001 : i19
+      %count = seq.compreg %0, %clock reset %init, %c0_i19 : i19
+      %done = comb.icmp eq %count, %c9001_i19 : i19
+      %0 = comb.add %count, %c1_i19 : i19
+
+      // Generate inputs to the adder.
+      %1, %2 = func.call @generateAdderInputs(%count) : (i19) -> (i42, i42)
+      %3 = hw.instance "dut" @Adder(a: %1: i42, b: %2: i42) -> (c: i42)
+
+      // Check results and track failures.
+      %4 = comb.add %1, %2 : i42
+      %5 = comb.icmp eq %3, %4 : i42
+      %true = hw.constant true
+      %success = seq.compreg %6, %clock reset %init, %true : i1
+      %6 = comb.and %success, %5 : i1
+
+      verif.yield %done, %success : i1, i1
+    }
+    ```
+  }];
+  let arguments = (ins
+    SymbolNameAttr:$sym_name,
+    DictionaryAttr:$parameters
+  );
+  let regions = (region SizedRegion<1>:$region);
+  let assemblyFormat = "$sym_name $parameters attr-dict-with-keyword $region";
+  let extraClassDeclaration = [{
+    static RegionKind getRegionKind(unsigned index) {
+      return RegionKind::Graph;
+    }
+  }];
+  let hasRegionVerifier = true;
+}
+
+def SymbolicValueOp : VerifOp<"symbolic_value", [
+  ParentOneOf<["verif::FormalOp", "hw::HWModuleOp"]>,
+]>{
+  let summary = "Create a symbolic value for formal verification";
+  let description = [{
+    This operation creates a new symbolic value that can be used to formally
+    verify designs. Verification tools will try to find concrete assignments for
+    symbolic values that violate asserts or make covers true. This value is not
+    fixed - the value taken can vary arbitrarily between timesteps.
+  }];
+  let results = (outs Res<AnyType, "", [MemAlloc]>:$result);
   let assemblyFormat = "attr-dict `:` type($result)";
 }
 
-def ConcreteInputOp : VerifOp<"concrete_input", [
-  AllTypesMatch<["init", "update", "result"]>, HasParent<"verif::FormalOp">
-]> {
-  let summary = "declare a concrete input for formal verification";
-  let description = [{
-    This operation declares a concrete input that can then be used in the 
-    reasoning surrounding symbolic inputs, allowing for a form of concolic 
-    reasoning to take place in a `verif.formal` block. Concrete inputs are 
-    defined by an initial value and an update SSA value. This is equivalent 
-    to a register with the parent `verif.formal`'s implicit clock, which is 
-    initialized with the init value and obtains a new value every implicit 
-    clock tick from the update value.
-  }];
-
-  let arguments = (ins AnyType:$init, AnyType:$update);
-  let results = (outs AnyType:$result);
-
-  let assemblyFormat = [{
-    $init `,` $update attr-dict `:` type($result)
-  }];
-}
-
 //===----------------------------------------------------------------------===//
-// Formal Contract Ops
+// Formal Contracts
 //===----------------------------------------------------------------------===//
 
 def ContractOp : VerifOp<"contract", [
-  SingleBlockImplicitTerminator<"verif::YieldOp">,
-  HasParent<"hw::HWModuleOp">, 
-  RegionKindInterface
+  AllTypesMatch<["inputs", "outputs"]>,
+  NoRegionArguments,
+  NoTerminator,
+  RegionKindInterface,
+  SingleBlock,
 ]>{
-  let summary = "declare a formal contract";
+  let summary = "A formal contract";
   let description = [{
-    This operation declares a formal contract that is used to create precondition 
-    and postconditions on a parent module. These are used as an abstraction to 
-    better modularize formal verification such that each module containing a contract 
-    is checked exactly once. The contract contains a single block where the block arguments 
-    represent the results of the code block that the contract is abstracting over. The 
-    operands represent the SSA values that this contract's results will replace.
-          
-    e.g. 
-    ```
-    hw.module @Bar(in %foo : i8, out "" : i8, out "1" : i8) { 
-      %o0, %o1 = verif.contract (%to0, %to1) : (i8, i8) -> (i8, i8) {
-        ^bb0(%bar.0 : i8, %bar.1 : i8): 
-          %c0_8 = hw.constant 0 : i8 
-          %prec = comb.icmp bin ugt %foo, %c0_8 : i8
-          verif.require %prec : i1
+    This operation creates a new formal contract which can be used to locally
+    verify a part of the IR and provide simplifying substitutions. Contracts
+    contain `verif.require` ops to establish conditions that must hold for a
+    piece of IR to work properly, and `verif.ensure` ops to describe the
+    properties that the piece of IR must guarantees when the requirements hold.
+    Outside of formal verification, operands are simply passed through to the
+    results.
 
-          %post = comb.icmp bin ugt %bar.0, %foo : i8
-          %post1 = comb.icmp bin ult %bar.1, %foo : i8
-          verif.ensure %post : i1
-          verif.ensure %post1 : i1
-          verif.yield %bar.0, %bar.1 : i8, i8
-      } 
-      /* ... Module definition ... */
-    }
-    ```
+    Contracts are checked by extracting them into their own `verif.formal` test
+    and replacing `require` with `assume` and `ensure` with `assert`. The
+    results of the contract are replaced with the operands of the contract.
 
-    This later is used to replace any instance of Bar during verification:  
-    ```
-    %bar.0, %bar.1 = hw.instance "bar" @Bar("foo" : %c42_8 : i8)  -> ("" : i8, "1" : i8)
+    Contracts are used as simplifications for other verification tasks by
+    inlining them and replacing `require` with `assert` and `ensure` with
+    `assume`. The results of the contract are replaced with symbolic values.
 
-    /* ... After PrepareForFormal Pass becomes ... */
-
-    %bar.0, %bar.1 = verif.contract (%c42_8) : (i8) -> (i8, i8) {
-      ^bb0(%arg1: i8):
-        %c0_8 = hw.constant 0 : i8
-        %prec = comb.icmp bin ugt %arg1, %c0_8 : i8
-        verif.assert %prec : i1
-
-        %bar.0 = verif.symbolic_input : i8
-        %bar.1 = verif.symbolic_input : i8
-        %post = comb.icmp bin ugt %bar.0, %arg1 : i8
-        %post1 = comb.icmp bin ult %bar.1, %arg1 : i8
-        verif.assume %post : i1
-        verif.assume %post1 : i1
-        verif.yield %bar.0, %bar.1 : i8, i8
-    }
-    
-    ```
+    See the documentation of the Verif dialect for more details.
   }];
-
   let arguments = (ins Variadic<AnyType>:$inputs);
-  let results = (outs Variadic<AnyType>:$results);
+  let results = (outs Variadic<AnyType>:$outputs);
   let regions = (region SizedRegion<1>:$body);
-
   let assemblyFormat = [{
-    `(` $inputs `)` attr-dict `:` `(` type($inputs) `)` `->` `(` type($results) `)` $body
+    ($inputs^ `:` type($inputs))? attr-dict-with-keyword $body
   }];
-
   let extraClassDeclaration = [{
-    /// Implement RegionKindInterface.
     static RegionKind getRegionKind(unsigned index) { 
       return RegionKind::Graph;
     }
-
-    /// Retrieves the region block arguments
-    BlockArgument getRegionArg(unsigned index) {
-      return getBody().front().getArguments()[index];
-    }
-
-    /// Retrieves the number of block arguments
-    unsigned getNumRegionArgs() {
-      return getBody().front().getNumArguments();
-    }
   }];
-
-  let hasRegionVerifier = 1;
 }
 
-class RequireLikeOp<string mnemonic, list<Trait> traits = [
-  HasParent<"verif::ContractOp">, AttrSizedOperandSegments
-]> : VerifOp<mnemonic, traits> {
-  let arguments = (ins LTLAnyPropertyType:$property,
-                      OptionalAttr<ClockEdgeAttr>:$edge, Optional<I1>:$clock,
-                      Optional<I1>:$enable,
-                      OptionalAttr<StrAttr>:$label);
+class RequireLikeOp<string mnemonic> : VerifOp<mnemonic, [
+  HasParent<"verif::ContractOp">,
+  DeclareOpInterfaceMethods<RequireLike>
+]> {
+  let arguments = (ins
+    LTLAnyPropertyType:$property,
+    Optional<I1>:$enable,
+    OptionalAttr<StrAttr>:$label
+  );
   let assemblyFormat = [{
-    $property (`if` $enable^)? (`,` $edge^ $clock)? 
-    (`label` $label^)? attr-dict `:` type($property)
+    $property
+    (`if` $enable^)?
+    (`label` $label^)?
+    attr-dict `:` type($property)
   }];
 }
 
 def RequireOp : RequireLikeOp<"require"> {
-  let summary = "define a precondition for the given contract";
+  let summary = "A precondition of a contract";
   let description = [{
-    This operation defines a precondition for the parent contract. 
-    Preconditions are assumed during the verification of a module and 
-    asserted during the verification of an instance of a module.
+    This operation specifies a condition that is assumed when checking against
+    the contract, and asserted when applying the contract as a simplification.
+
+    The `verif.require` op is commonly used to specify the conditions that input
+    values into a part of the IR must fulfill in order for the IR to work as
+    expected, i.e., as outlined in the contract.
   }];
 }
 
-
 def EnsureOp : RequireLikeOp<"ensure">{
-  let summary = "define a postcondition for the given contract";
+  let summary = "A postcondition of a contract";
   let description = [{
-    This operation defines a postcondition for the parent contract. 
-    Postconditions are asserted during the verification of a module and 
-    assumed during the verification of an instance of a module.
+    This operation specifies a condition that is asserted when checking a
+    contract, and assumed when applying the contract as a simplification.
+
+    The `verif.ensure` op is commonly used to specify the conditions that output
+    values from a part of the IR are guaranteed to fulfill, under the condition
+    that all requirements are fulfilled.
   }];
 }
 

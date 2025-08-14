@@ -100,4 +100,70 @@ def MaximizeSSA : Pass<"maximize-ssa", "::mlir::ModuleOp"> {
   let constructor = "circt::createMaximizeSSAPass()";
 }
 
+def PrintOpCount : Pass<"print-op-count", "::mlir::ModuleOp"> {
+  let summary = "Print operation count analysis results";
+  let description = [{
+    This pass prints data on operation counts in a builtin.module.
+  }];
+  let constructor = "circt::createPrintOpCountPass()";
+  let options = [
+    Option<"emissionFormat", "emission-format",
+           "circt::OpCountEmissionFormat",
+           "circt::OpCountEmissionFormat::Readable",
+           "Specify the format to emit op count info in",
+           [{::llvm::cl::values(
+            clEnumValN(circt::OpCountEmissionFormat::Readable,
+              "readable", "Emit the data in human-readable form"),
+            clEnumValN(circt::OpCountEmissionFormat::ReadableSorted,
+              "readable-sorted", "Emit the data in human-readable form, sorted for output determinism"),
+            clEnumValN(circt::OpCountEmissionFormat::JSON,
+              "json", "Emit the data in JSON form")
+          )}]
+           >
+  ];
+}
+
+def MemoryBanking : Pass<"memory-banking", "::mlir::func::FuncOp"> {
+  let summary = "Partition the memories used in affine parallel loops into banks";
+  let constructor = "circt::createMemoryBankingPass()";
+  let options = [
+    Option<"bankingFactor", "factor", "unsigned", /*default=*/"1",
+           "Use this banking factor for all memories being partitioned">,
+    Option<"bankingDimension", "dimension", "int", /*default=*/"-1",
+           "The dimension along which to bank the memory. If -1, the innermost dimension with size > 1 is used.">
+  ];
+  let dependentDialects = ["mlir::memref::MemRefDialect, mlir::scf::SCFDialect, mlir::affine::AffineDialect"];
+}
+
+def IndexSwitchToIf : Pass<"switch-to-if", "::mlir::ModuleOp"> {
+  let summary = "Index switch to if";
+  let description = [{
+      Transform `scf.index_switch` to a series of `scf.if` operations.
+      This is necessary for dialects that don't support switch statements, e.g., Calyx.
+      An example:
+      ```
+        %0 = scf.index_switch %cond -> i32
+          case 0 { ... }
+          case 1 { ... }
+          ...
+
+        =>
+
+        %c0 = arith.cmpi eq %0, 0
+        %c1 = arith.cmpi eq %0, 1
+        %0 = scf.if %c0 {
+         ...
+        } else {
+          %1 = scf.if %c1 {
+            ...
+          } else {
+            ...
+          }
+        }
+      ```
+  }];
+  let constructor = "circt::createIndexSwitchToIfPass()";
+  let dependentDialects = ["mlir::scf::SCFDialect"];
+}
+
 #endif // CIRCT_TRANSFORMS_PASSES

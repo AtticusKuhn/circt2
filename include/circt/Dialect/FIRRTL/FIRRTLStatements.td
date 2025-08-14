@@ -368,6 +368,8 @@ class VerifIntrinsicOp<string mnemonic, list<Trait> traits = []> :
 def VerifAssertIntrinsicOp : VerifIntrinsicOp<"assert">;
 def VerifAssumeIntrinsicOp : VerifIntrinsicOp<"assume">;
 def VerifCoverIntrinsicOp : VerifIntrinsicOp<"cover">;
+def VerifRequireIntrinsicOp : VerifIntrinsicOp<"require">;
+def VerifEnsureIntrinsicOp : VerifIntrinsicOp<"ensure">;
 
 //===----------------------------------------------------------------------===//
 // Layer Block Op
@@ -403,6 +405,7 @@ def LayerBlockOp : FIRRTLOp<
     $layerName $region attr-dict
   }];
   let hasVerifier = 1;
+  let hasCanonicalizeMethod = 1;
 }
 
 #endif // CIRCT_DIALECT_FIRRTL_FIRRTLSTATEMENTS_TD

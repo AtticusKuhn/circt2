@@ -14,6 +14,7 @@
 #define CIRCT_TRANSFORMS_PASSES_H
 
 #include "circt/Dialect/HW/HWOpInterfaces.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 #include <limits>
@@ -25,7 +26,18 @@ namespace circt {
 //===----------------------------------------------------------------------===//
 
 #define GEN_PASS_DECL
+
+enum class OpCountEmissionFormat {
+  // Specify the format for op count data emission
+  Readable,
+  ReadableSorted,
+  JSON
+};
+
 #include "circt/Transforms/Passes.h.inc"
+
+void populateArithToCombPatterns(mlir::RewritePatternSet &patterns,
+                                 TypeConverter &typeConverter);
 
 std::unique_ptr<mlir::Pass> createMapArithToCombPass();
 std::unique_ptr<mlir::Pass> createFlattenMemRefPass();
@@ -34,6 +46,11 @@ std::unique_ptr<mlir::Pass> createStripDebugInfoWithPredPass(
     const std::function<bool(mlir::Location)> &pred);
 std::unique_ptr<mlir::Pass> createMaximizeSSAPass();
 std::unique_ptr<mlir::Pass> createInsertMergeBlocksPass();
+std::unique_ptr<mlir::Pass> createPrintOpCountPass();
+std::unique_ptr<mlir::Pass>
+createMemoryBankingPass(std::optional<unsigned> bankingFactor = std::nullopt,
+                        std::optional<int> bankingDimension = std::nullopt);
+std::unique_ptr<mlir::Pass> createIndexSwitchToIfPass();
 
 //===----------------------------------------------------------------------===//
 // Utility functions.

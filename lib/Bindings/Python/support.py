@@ -88,7 +88,7 @@ def type_to_pytype(t) -> ir.Type:
   if t.__class__ != ir.Type:
     return t
 
-  from .dialects import esi, hw, seq
+  from .dialects import esi, hw, seq, rtg, rtgtest
   try:
     return ir.IntegerType(t)
   except ValueError:
@@ -122,7 +122,59 @@ def type_to_pytype(t) -> ir.Type:
   except ValueError:
     pass
   try:
+    return esi.AnyType(t)
+  except ValueError:
+    pass
+  try:
     return esi.BundleType(t)
+  except ValueError:
+    pass
+  try:
+    return rtg.LabelType(t)
+  except ValueError:
+    pass
+  try:
+    return rtg.SetType(t)
+  except ValueError:
+    pass
+  try:
+    return rtg.BagType(t)
+  except ValueError:
+    pass
+  try:
+    return rtg.SequenceType(t)
+  except ValueError:
+    pass
+  try:
+    return rtg.RandomizedSequenceType(t)
+  except ValueError:
+    pass
+  try:
+    return rtg.DictType(t)
+  except ValueError:
+    pass
+  try:
+    return rtgtest.IntegerRegisterType(t)
+  except ValueError:
+    pass
+  try:
+    return rtgtest.Imm5Type(t)
+  except ValueError:
+    pass
+  try:
+    return rtgtest.Imm12Type(t)
+  except ValueError:
+    pass
+  try:
+    return rtgtest.Imm13Type(t)
+  except ValueError:
+    pass
+  try:
+    return rtgtest.Imm21Type(t)
+  except ValueError:
+    pass
+  try:
+    return rtgtest.Imm32Type(t)
   except ValueError:
     pass
 
@@ -235,6 +287,7 @@ class BackedgeBuilder(AbstractContextManager):
       self.instance_of = instance_of
       self.op_view = op_view
       self.port_name = backedge_name
+      self.loc = loc
       self.erased = False
 
     @property
@@ -290,6 +343,8 @@ class BackedgeBuilder(AbstractContextManager):
       if edge.op_view is not None:
         op = edge.op_view.operation
         msg += "Instance:   " + str(op)
+      if edge.loc is not None:
+        msg += "Location:   " + str(edge.loc)
       errors.append(msg)
 
     if errors:

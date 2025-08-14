@@ -56,7 +56,7 @@ struct HasBeenResetOpConversion : OpConversionPattern<verif::HasBeenResetOp> {
     Value constZero = seq::createConstantInitialValue(
         rewriter, op->getLoc(), rewriter.getIntegerAttr(i1, 0));
 
-    // Generate the constant used to enegate the
+    // Generate the constant used to negate the reset value
     Value constOne = rewriter.create<hw::ConstantOp>(op.getLoc(), i1, 1);
 
     // Create a backedge for the register to be used in the OrOp
@@ -134,10 +134,9 @@ void LowerLTLToCorePass::runOnOperation() {
   // Basic materializations
   converter.addTargetMaterialization(
       [&](mlir::OpBuilder &builder, mlir::Type resultType,
-          mlir::ValueRange inputs,
-          mlir::Location loc) -> std::optional<mlir::Value> {
+          mlir::ValueRange inputs, mlir::Location loc) -> mlir::Value {
         if (inputs.size() != 1)
-          return std::nullopt;
+          return Value();
         return builder
             .create<UnrealizedConversionCastOp>(loc, resultType, inputs[0])
             ->getResult(0);
@@ -145,10 +144,9 @@ void LowerLTLToCorePass::runOnOperation() {
 
   converter.addSourceMaterialization(
       [&](mlir::OpBuilder &builder, mlir::Type resultType,
-          mlir::ValueRange inputs,
-          mlir::Location loc) -> std::optional<mlir::Value> {
+          mlir::ValueRange inputs, mlir::Location loc) -> mlir::Value {
         if (inputs.size() != 1)
-          return std::nullopt;
+          return Value();
         return builder
             .create<UnrealizedConversionCastOp>(loc, resultType, inputs[0])
             ->getResult(0);

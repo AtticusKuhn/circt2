@@ -1,13 +1,13 @@
 // RUN: circt-opt %s --lower-smt-to-z3-llvm --canonicalize | \
-// RUN: mlir-cpu-runner -e entry -entry-point-result=void --shared-libs=%libz3 | \
+// RUN: mlir-runner -e entry -entry-point-result=void --shared-libs=%libz3 | \
 // RUN: FileCheck %s
 
 // RUN: circt-opt %s --lower-smt-to-z3-llvm=debug=true --canonicalize | \
-// RUN: mlir-cpu-runner -e entry -entry-point-result=void --shared-libs=%libz3 | \
+// RUN: mlir-runner -e entry -entry-point-result=void --shared-libs=%libz3 | \
 // RUN: FileCheck %s
 
 // REQUIRES: libz3
-// REQUIRES: mlir-cpu-runner
+// REQUIRES: mlir-runner
 
 func.func @entry() {
   %false = llvm.mlir.constant(0 : i1) : i1
@@ -149,6 +149,93 @@ func.func @entry() {
       smt.yield %2, %3 : !smt.sort<"B">, !smt.sort<"B">
     }
     func.call @check(%1) : (!smt.bool) -> ()
+    smt.yield
+  }
+
+  // CHECK: unsat
+  // CHECK: Res: -1
+  // CHECK: sat
+  // CHECK: Res: 1
+  smt.solver () : () -> () {
+    %c3 = smt.int.constant 3
+    %c4 = smt.int.constant 4
+    %unsat_eq = smt.eq %c3, %c4 : !smt.int
+    smt.push 1
+    func.call @check(%unsat_eq) : (!smt.bool) -> ()
+    smt.pop 1
+    %sat_eq = smt.eq %c3, %c3 : !smt.int
+    func.call @check(%sat_eq) : (!smt.bool) -> ()
+    smt.yield
+  }
+
+  // CHECK: unsat
+  // CHECK: Res: -1
+  // CHECK: sat
+  // CHECK: Res: 1
+  smt.solver () : () -> () {
+    %c3 = smt.int.constant 3
+    %c4 = smt.int.constant 4
+    %unsat_eq = smt.eq %c3, %c4 : !smt.int
+    func.call @check(%unsat_eq) : (!smt.bool) -> ()
+    smt.reset
+    %sat_eq = smt.eq %c3, %c3 : !smt.int
+    func.call @check(%sat_eq) : (!smt.bool) -> ()
+    smt.yield
+  }
+
+  // CHECK: unknown
+  // CHECK: Res: 0
+  smt.solver () : () -> () {
+    smt.set_logic "HORN"
+    %c = smt.declare_fun : !smt.int
+    %c4 = smt.int.constant 4
+    %eq = smt.eq %c, %c4 : !smt.int
+    func.call @check(%eq) : (!smt.bool) -> ()
+    smt.yield
+  }
+
+  // CHECK: unsat
+  // CHECK: Res: -1
+  smt.solver () : () -> () {
+    %c4 = smt.int.constant 4
+    %c4_bv16 = smt.bv.constant #smt.bv<4> : !smt.bv<16>
+    %int2bv = smt.int2bv %c4 : !smt.bv<16>
+    %eq = smt.distinct %c4_bv16, %int2bv : !smt.bv<16>
+    func.call @check(%eq) : (!smt.bool) -> ()
+    smt.yield
+  }
+
+  // CHECK: unsat
+  // CHECK: Res: -1
+  smt.solver () : () -> () {
+    %c4 = smt.int.constant 4
+    %c4_bv16 = smt.bv.constant #smt.bv<4> : !smt.bv<16>
+    %bv2int = smt.bv2int %c4_bv16 : !smt.bv<16>
+    %eq = smt.distinct %c4, %bv2int : !smt.int
+    func.call @check(%eq) : (!smt.bool) -> ()
+    smt.yield
+  }
+
+  // CHECK: unsat
+  // CHECK: Res: -1
+  smt.solver () : () -> () {
+    %c-4 = smt.int.constant -4
+    %c-4_bv16 = smt.bv.constant #smt.bv<-4> : !smt.bv<16>
+    %bv2int = smt.bv2int %c-4_bv16 signed : !smt.bv<16>
+    %eq = smt.distinct %c-4, %bv2int : !smt.int
+    func.call @check(%eq) : (!smt.bool) -> ()
+    smt.yield
+  }
+
+  // Check that unsigned conversion actually produces unsigned result
+  // CHECK: unsat
+  // CHECK: Res: -1
+  smt.solver () : () -> () {
+    %c-4 = smt.int.constant -4
+    %c-4_bv16 = smt.bv.constant #smt.bv<-4> : !smt.bv<16>
+    %bv2int = smt.bv2int %c-4_bv16 : !smt.bv<16>
+    %eq = smt.eq %c-4, %bv2int : !smt.int
+    func.call @check(%eq) : (!smt.bool) -> ()
     smt.yield
   }
 

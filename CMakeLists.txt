@@ -4,33 +4,22 @@
 ##
 ##===----------------------------------------------------------------------===//
 
+<<<<<<< HEAD
 
 cmake_minimum_required(VERSION 3.13.4)
+=======
+cmake_minimum_required(VERSION 3.20.0)
+>>>>>>> origin/main
 
-if(POLICY CMP0068)
-  cmake_policy(SET CMP0068 NEW)
-  set(CMAKE_BUILD_WITH_INSTALL_NAME_DIR ON)
-endif()
+#-------------------------------------------------------------------------------
+# Project setup and globals
+#-------------------------------------------------------------------------------
 
-if(POLICY CMP0075)
-  cmake_policy(SET CMP0075 NEW)
-endif()
+  project(circt LANGUAGES CXX C)
 
-if(POLICY CMP0077)
-  cmake_policy(SET CMP0077 NEW)
-endif()
+set(CMAKE_BUILD_WITH_INSTALL_NAME_DIR ON)
 
-# CMP0116: Ninja generators transform `DEPFILE`s from `add_custom_command()`
-# New in CMake 3.20. https://cmake.org/cmake/help/latest/policy/CMP0116.html
-if(POLICY CMP0116)
-  cmake_policy(SET CMP0116 OLD)
-endif()
-
-if(POLICY CMP0135)
-  cmake_policy(SET CMP0135 NEW)
-endif()
-
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 17 CACHE STRING "C++ standard to conform to")
 set(CMAKE_CXX_STANDARD_REQUIRED YES)
 
 # If we are not building as a part of LLVM, build Circt as an
@@ -44,11 +33,6 @@ if( CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR )
 # Generate a CompilationDatabase (compile_commands.json file) for our build,
 # for use by clang_complete, YouCompleteMe, etc.
   set(CMAKE_EXPORT_COMPILE_COMMANDS 1)
-
-#-------------------------------------------------------------------------------
-# Project setup and globals
-#-------------------------------------------------------------------------------
-  project(circt LANGUAGES CXX C)
 
 #-------------------------------------------------------------------------------
 # Options and settings
@@ -186,6 +170,9 @@ option(CIRCT_INCLUDE_TOOLS "Generate build targets for the CIRCT tools." ON)
 option(CIRCT_BUILD_TOOLS "Build the CIRCT tools. If OFF, just generate build targets." ON)
 set(CIRCT_TOOLS_INSTALL_DIR "${CMAKE_INSTALL_BINDIR}" CACHE PATH
     "Path for binary subdirectory (defaults to '${CMAKE_INSTALL_BINDIR}')")
+
+option(CIRCT_INCLUDE_TESTS
+       "Generate build targets for the CIRCT tests." ON)
 
 list(APPEND CMAKE_MODULE_PATH "${MLIR_MAIN_SRC_DIR}/cmake/modules")
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/modules")
@@ -511,8 +498,12 @@ option(CIRCT_BINDINGS_PYTHON_ENABLED "Enables CIRCT Python bindings." OFF)
 
 if(CIRCT_BINDINGS_PYTHON_ENABLED)
   message(STATUS "CIRCT Python bindings are enabled.")
-  include(MLIRDetectPythonEnv)
-  mlir_configure_python_dev_packages()
+  set(MLIR_DISABLE_CONFIGURE_PYTHON_DEV_PACKAGES 0)
+  mlir_detect_nanobind_install()
+  # Prime the search like mlir_configure_python_dev_modules
+  find_package(Python3 3.8 COMPONENTS Interpreter Development)
+  find_package(Python3 3.8 COMPONENTS Interpreter Development.Module)
+  find_package(nanobind 2.4.0 CONFIG REQUIRED)
 else()
   message(STATUS "CIRCT Python bindings are disabled.")
   # Lookup python either way as some integration tests use python without the
@@ -619,17 +610,26 @@ endif()
 # Directory setup
 #-------------------------------------------------------------------------------
 
+if (CIRCT_INCLUDE_TESTS)
+  add_definitions(-DCIRCT_INCLUDE_TESTS)
+endif()
+
 add_subdirectory(include/circt)
 add_subdirectory(lib)
 if(CIRCT_INCLUDE_TOOLS)
   add_subdirectory(tools)
 endif()
-if (CIRCT_GTEST_AVAILABLE)
-  add_subdirectory(unittests)
-endif()
-add_subdirectory(test)
-add_subdirectory(integration_test)
 add_subdirectory(frontends)
+
+if (CIRCT_INCLUDE_TESTS)
+  # Test directories are added after everything else so their cmake files can
+  # use targets and target properties defined by the things they test.
+  if (CIRCT_GTEST_AVAILABLE)
+    add_subdirectory(unittests)
+  endif()
+  add_subdirectory(test)
+  add_subdirectory(integration_test)
+endif()
 
 option(CIRCT_INCLUDE_DOCS "Generate build targets for the CIRCT docs.")
 if (CIRCT_INCLUDE_DOCS)

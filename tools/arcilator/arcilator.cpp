@@ -11,7 +11,9 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "circt/Conversion/ArcToLLVM.h"
 #include "circt/Conversion/CombToArith.h"
+#include "circt/Conversion/ConvertToArcs.h"
 #include "circt/Conversion/SeqToSV.h"
 #include "circt/Dialect/Arc/ArcDialect.h"
 #include "circt/Dialect/Arc/ArcInterfaces.h"
@@ -19,13 +21,18 @@
 #include "circt/Dialect/Arc/ArcPasses.h"
 #include "circt/Dialect/Arc/ModelInfo.h"
 #include "circt/Dialect/Arc/ModelInfoExport.h"
+#include "circt/Dialect/Comb/CombDialect.h"
 #include "circt/Dialect/Emit/EmitDialect.h"
+#include "circt/Dialect/Emit/EmitPasses.h"
 #include "circt/Dialect/HW/HWPasses.h"
+#include "circt/Dialect/LLHD/IR/LLHDDialect.h"
+#include "circt/Dialect/OM/OMDialect.h"
+#include "circt/Dialect/OM/OMPasses.h"
+#include "circt/Dialect/SV/SVDialect.h"
 #include "circt/Dialect/Seq/SeqPasses.h"
 #include "circt/Dialect/Sim/SimDialect.h"
 #include "circt/Dialect/Sim/SimPasses.h"
-#include "circt/InitAllDialects.h"
-#include "circt/InitAllPasses.h"
+#include "circt/Dialect/Verif/VerifDialect.h"
 #include "circt/Support/Passes.h"
 #include "circt/Support/Version.h"
 #include "mlir/Bytecode/BytecodeReader.h"
@@ -35,6 +42,7 @@
 #include "mlir/Dialect/DLTI/DLTI.h"
 #include "mlir/Dialect/Func/Extensions/InlinerExtension.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Index/IR/IndexDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/Transforms/InlinerInterfaceImpl.h"
 #include "mlir/Dialect/LLVMIR/Transforms/Passes.h"
@@ -246,7 +254,10 @@ static void populateHwModuleToArcPipeline(PassManager &pm) {
   // represented as intrinsic ops.
   if (untilReached(UntilPreprocessing))
     return;
+  pm.addPass(om::createStripOMPass());
+  pm.addPass(emit::createStripEmitPass());
   pm.addPass(createLowerFirMemPass());
+  pm.addPass(createLowerVerifSimulationsPass());
   {
     arc::AddTapsOptions opts;
     opts.tapPorts = observePorts;
@@ -315,8 +326,6 @@ static void populateHwModuleToArcPipeline(PassManager &pm) {
   if (untilReached(UntilStateLowering))
     return;
   pm.addPass(arc::createLowerStatePass());
-  pm.addPass(createCSEPass());
-  pm.addPass(arc::createArcCanonicalizerPass());
 
   // TODO: LowerClocksToFuncsPass might not properly consider scf.if operations
   // (or nested regions in general) and thus errors out when muxes are also
@@ -324,15 +333,10 @@ static void populateHwModuleToArcPipeline(PassManager &pm) {
   // TODO: InlineArcs seems to not properly handle scf.if operations, thus the
   // following is commented out
   // pm.addPass(arc::createMuxToControlFlowPass());
-
-  if (shouldInline) {
+  if (shouldInline)
     pm.addPass(arc::createInlineArcsPass());
-    pm.addPass(arc::createArcCanonicalizerPass());
-    pm.addPass(createCSEPass());
-  }
 
-  pm.addPass(arc::createGroupResetsAndEnablesPass());
-  pm.addPass(arc::createLegalizeStateUpdatePass());
+  pm.addPass(arc::createMergeIfsPass());
   pm.addPass(createCSEPass());
   pm.addPass(arc::createArcCanonicalizerPass());
 
@@ -356,7 +360,6 @@ static void populateArcToLLVMPipeline(PassManager &pm) {
   // Lower the arcs and update functions to LLVM.
   if (untilReached(UntilLLVMLowering))
     return;
-  pm.addPass(createConvertCombToArithPass());
   pm.addPass(createLowerArcToLLVMPass());
   pm.addPass(createCSEPass());
   pm.addPass(arc::createArcCanonicalizerPass());
@@ -586,16 +589,19 @@ static LogicalResult executeArcilator(MLIRContext &context) {
     comb::CombDialect,
     emit::EmitDialect,
     hw::HWDialect,
-    mlir::DLTIDialect,
-    mlir::LLVM::LLVMDialect,
+    llhd::LLHDDialect,
     mlir::arith::ArithDialect,
     mlir::cf::ControlFlowDialect,
+    mlir::DLTIDialect,
     mlir::func::FuncDialect,
+    mlir::index::IndexDialect,
+    mlir::LLVM::LLVMDialect,
     mlir::scf::SCFDialect,
     om::OMDialect,
     seq::SeqDialect,
     sim::SimDialect,
-    sv::SVDialect
+    sv::SVDialect,
+    verif::VerifDialect
   >();
   // clang-format on
 

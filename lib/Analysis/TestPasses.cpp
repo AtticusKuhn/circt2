@@ -13,6 +13,7 @@
 #include "circt/Analysis/DebugAnalysis.h"
 #include "circt/Analysis/DependenceAnalysis.h"
 #include "circt/Analysis/FIRRTLInstanceInfo.h"
+#include "circt/Analysis/OpCountAnalysis.h"
 #include "circt/Analysis/SchedulingAnalysis.h"
 #include "circt/Dialect/FIRRTL/FIRRTLInstanceGraph.h"
 #include "circt/Dialect/HW/HWInstanceGraph.h"
@@ -242,7 +243,15 @@ static void printModuleInfo(igraph::ModuleOpInterface op,
                << "    anyInstanceUnderLayer: "
                << iInfo.anyInstanceUnderLayer(op) << "\n"
                << "    allInstancesUnderLayer: "
-               << iInfo.allInstancesUnderLayer(op) << "\n";
+               << iInfo.allInstancesUnderLayer(op) << "\n"
+               << "    anyInstanceInDesign: " << iInfo.anyInstanceInDesign(op)
+               << "\n"
+               << "    allInstancesInDesign: " << iInfo.allInstancesInDesign(op)
+               << "\n"
+               << "    anyInstanceInEffectiveDesign: "
+               << iInfo.anyInstanceInEffectiveDesign(op) << "\n"
+               << "    allInstancesInEffectiveDesign: "
+               << iInfo.allInstancesInEffectiveDesign(op) << "\n";
 }
 
 void FIRRTLInstanceInfoPass::runOnOperation() {

@@ -16,6 +16,10 @@
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/LLHD/IR/LLHDOps.h"
 #include "circt/Dialect/Moore/MooreOps.h"
+#include "circt/Dialect/Sim/SimOps.h"
+#include "circt/Dialect/Verif/VerifOps.h"
+#include "circt/Transforms/Passes.h"
+#include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -164,7 +168,8 @@ struct InstanceOpConversion : public OpConversionPattern<InstanceOp> {
     auto instOp = rewriter.create<hw::InstanceOp>(
         op.getLoc(), op.getResultTypes(), instName, moduleName, op.getInputs(),
         op.getInputNamesAttr(), op.getOutputNamesAttr(),
-        /*Parameter*/ rewriter.getArrayAttr({}), /*InnerSymbol*/ nullptr);
+        /*Parameter*/ rewriter.getArrayAttr({}), /*InnerSymbol*/ nullptr,
+        /*doNotPrint*/ nullptr);
 
     // Replace uses chain and erase the original op.
     op.replaceAllUsesWith(instOp.getResults());
@@ -190,6 +195,9 @@ static void getValuesToObserve(Region *region,
   region->getParentOp()->walk<WalkOrder::PreOrder, ForwardDominanceIterator<>>(
       [&](Operation *operation) {
         for (auto value : operation->getOperands()) {
+          if (isa<BlockArgument>(value))
+            value = rewriter.getRemappedValue(value);
+
           if (region->isAncestor(value.getParentRegion()))
             continue;
           if (auto *defOp = value.getDefiningOp();
@@ -334,6 +342,18 @@ struct WaitEventOpConversion : public OpConversionPattern<WaitEventOp> {
     //     opB
     auto *resumeBlock =
         rewriter.splitBlock(op->getBlock(), ++Block::iterator(op));
+
+    // If the 'wait_event' op is empty, we can lower it to a 'llhd.wait' op
+    // without any observed values, but since the process will never wake up
+    // from suspension anyway, we can also just terminate it using the
+    // 'llhd.halt' op.
+    if (op.getBody().front().empty()) {
+      // Let the cleanup iteration after the dialect conversion clean up all
+      // remaining unreachable blocks.
+      rewriter.replaceOpWithNewOp<llhd::HaltOp>(op);
+      return success();
+    }
+
     auto *waitBlock = rewriter.createBlock(resumeBlock);
     auto *checkBlock = rewriter.createBlock(resumeBlock);
 
@@ -352,8 +372,11 @@ struct WaitEventOpConversion : public OpConversionPattern<WaitEventOp> {
     SmallVector<Value> valuesBefore;
     rewriter.setInsertionPointToEnd(waitBlock);
     auto clonedOp = cast<WaitEventOp>(rewriter.clone(*op));
+    bool allDetectsAreAnyChange = true;
     for (auto detectOp :
          llvm::make_early_inc_range(clonedOp.getOps<DetectEventOp>())) {
+      if (detectOp.getEdge() != Edge::AnyChange || detectOp.getCondition())
+        allDetectsAreAnyChange = false;
       valuesBefore.push_back(detectOp.getInput());
       rewriter.eraseOp(detectOp);
     }
@@ -390,10 +413,26 @@ struct WaitEventOpConversion : public OpConversionPattern<WaitEventOp> {
     // Helper function to detect if a certain change occurred between a value
     // before the `llhd.wait` and after.
     auto computeTrigger = [&](Value before, Value after, Edge edge) -> Value {
-      before = typeConverter->materializeTargetConversion(
-          rewriter, loc, rewriter.getI1Type(), before);
-      after = typeConverter->materializeTargetConversion(
-          rewriter, loc, rewriter.getI1Type(), after);
+      assert(before.getType() == after.getType() &&
+             "mismatched types after clone op");
+      auto beforeType = cast<IntType>(before.getType());
+
+      // 9.4.2 IEEE 1800-2017: An edge event shall be detected only on the LSB
+      // of the expression
+      if (beforeType.getWidth() != 1 && edge != Edge::AnyChange) {
+        constexpr int LSB = 0;
+        beforeType =
+            IntType::get(rewriter.getContext(), 1, beforeType.getDomain());
+        before =
+            rewriter.create<moore::ExtractOp>(loc, beforeType, before, LSB);
+        after = rewriter.create<moore::ExtractOp>(loc, beforeType, after, LSB);
+      }
+
+      auto intType = rewriter.getIntegerType(beforeType.getWidth());
+      before = typeConverter->materializeTargetConversion(rewriter, loc,
+                                                          intType, before);
+      after = typeConverter->materializeTargetConversion(rewriter, loc, intType,
+                                                         after);
 
       if (edge == Edge::AnyChange)
         return rewriter.create<comb::ICmpOp>(loc, ICmpPredicate::ne, before,
@@ -427,33 +466,38 @@ struct WaitEventOpConversion : public OpConversionPattern<WaitEventOp> {
     // value corresponds to the detect op's input.
     SmallVector<Value> triggers;
     for (auto [detectOp, before] : llvm::zip(detectOps, valuesBefore)) {
-      // TODO: Support multi-bit values. Edge detection occurs per-bit.
-      if (auto intType = dyn_cast<IntType>(before.getType());
-          !intType || intType.getWidth() != 1)
-        return detectOp->emitError() << "requires single bit operand";
+      if (!allDetectsAreAnyChange) {
+        if (!isa<IntType>(before.getType()))
+          return detectOp->emitError() << "requires int operand";
 
-      rewriter.setInsertionPoint(detectOp);
-      auto trigger =
-          computeTrigger(before, detectOp.getInput(), detectOp.getEdge());
-      if (detectOp.getCondition()) {
-        auto condition = typeConverter->materializeTargetConversion(
-            rewriter, loc, rewriter.getI1Type(), detectOp.getCondition());
-        trigger = rewriter.create<comb::AndOp>(loc, trigger, condition, true);
+        rewriter.setInsertionPoint(detectOp);
+        auto trigger =
+            computeTrigger(before, detectOp.getInput(), detectOp.getEdge());
+        if (detectOp.getCondition()) {
+          auto condition = typeConverter->materializeTargetConversion(
+              rewriter, loc, rewriter.getI1Type(), detectOp.getCondition());
+          trigger = rewriter.create<comb::AndOp>(loc, trigger, condition, true);
+        }
+        triggers.push_back(trigger);
       }
-      triggers.push_back(trigger);
+
       rewriter.eraseOp(detectOp);
     }
 
-    // If any `detect_event` op detected an event, branch to the "resume" block
-    // which contains any code after the `wait_event` op. If no events were
-    // detected, branch back to the "wait" block to wait for the next change on
-    // the interesting signals.
     rewriter.setInsertionPointToEnd(checkBlock);
-    if (!triggers.empty()) {
+    if (triggers.empty()) {
+      // If there are no triggers to check, we always branch to the resume
+      // block. If there are no detect_event operations in the wait event, the
+      // 'llhd.wait' operation will not have any observed values and thus the
+      // process will hang there forever.
+      rewriter.create<cf::BranchOp>(loc, resumeBlock);
+    } else {
+      // If any `detect_event` op detected an event, branch to the "resume"
+      // block which contains any code after the `wait_event` op. If no events
+      // were detected, branch back to the "wait" block to wait for the next
+      // change on the interesting signals.
       auto triggered = rewriter.createOrFold<comb::OrOp>(loc, triggers, true);
       rewriter.create<cf::CondBranchOp>(loc, triggered, resumeBlock, waitBlock);
-    } else {
-      rewriter.create<cf::BranchOp>(loc, waitBlock);
     }
 
     return success();
@@ -496,6 +540,44 @@ struct VariableOpConversion : public OpConversionPattern<VariableOp> {
   }
 };
 
+struct NetOpConversion : public OpConversionPattern<NetOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(NetOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    if (op.getKind() != NetKind::Wire)
+      return rewriter.notifyMatchFailure(loc, "only wire nets supported");
+
+    auto resultType = typeConverter->convertType(op.getResult().getType());
+    if (!resultType)
+      return rewriter.notifyMatchFailure(loc, "invalid net type");
+
+    // TODO: Once the core dialects support four-valued integers, this code
+    // will additionally need to generate an all-X value for four-valued nets.
+    auto elementType = cast<hw::InOutType>(resultType).getElementType();
+    int64_t width = hw::getBitWidth(elementType);
+    if (width == -1)
+      return failure();
+    auto constZero = rewriter.create<hw::ConstantOp>(loc, APInt(width, 0));
+    auto init =
+        rewriter.createOrFold<hw::BitcastOp>(loc, elementType, constZero);
+
+    auto signal = rewriter.replaceOpWithNewOp<llhd::SignalOp>(
+        op, resultType, op.getNameAttr(), init);
+
+    if (auto assignedValue = adaptor.getAssignment()) {
+      auto timeAttr = llhd::TimeAttr::get(resultType.getContext(), 0U,
+                                          llvm::StringRef("ns"), 0, 1);
+      auto time = rewriter.create<llhd::ConstantTimeOp>(loc, timeAttr);
+      rewriter.create<llhd::DrvOp>(loc, signal, assignedValue, time, Value{});
+    }
+
+    return success();
+  }
+};
+
 //===----------------------------------------------------------------------===//
 // Expression Conversion
 //===----------------------------------------------------------------------===//
@@ -511,6 +593,34 @@ struct ConstantOpConv : public OpConversionPattern<ConstantOp> {
     auto type = rewriter.getIntegerType(value.getBitWidth());
     rewriter.replaceOpWithNewOp<hw::ConstantOp>(
         op, type, rewriter.getIntegerAttr(type, value));
+    return success();
+  }
+};
+
+struct StringConstantOpConv : public OpConversionPattern<StringConstantOp> {
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(moore::StringConstantOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    const auto str = op.getValue();
+    const unsigned byteWidth = str.size() * 8;
+    const auto resultType =
+        typeConverter->convertType(op.getResult().getType());
+    if (const auto intType = mlir::dyn_cast<IntegerType>(resultType)) {
+      if (intType.getWidth() < byteWidth) {
+        return rewriter.notifyMatchFailure(op,
+                                           "invalid string constant type size");
+      }
+    } else {
+      return rewriter.notifyMatchFailure(op, "invalid string constant type");
+    }
+    APInt value(byteWidth, 0);
+    for (size_t i = 0; i < str.size(); ++i) {
+      const auto asciiChar = static_cast<uint8_t>(str[i]);
+      value |= APInt(byteWidth, asciiChar) << (8 * (str.size() - 1 - i));
+    }
+    rewriter.replaceOpWithNewOp<hw::ConstantOp>(
+        op, resultType, rewriter.getIntegerAttr(resultType, value));
     return success();
   }
 };
@@ -544,27 +654,113 @@ struct ExtractOpConversion : public OpConversionPattern<ExtractOp> {
   LogicalResult
   matchAndRewrite(ExtractOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    // TODO: properly handle out-of-bounds accesses
+    // TODO: return X if the domain is four-valued for out-of-bounds accesses
+    // once we support four-valued lowering
     Type resultType = typeConverter->convertType(op.getResult().getType());
     Type inputType = adaptor.getInput().getType();
+    int32_t low = adaptor.getLowBit();
 
     if (isa<IntegerType>(inputType)) {
-      rewriter.replaceOpWithNewOp<comb::ExtractOp>(
-          op, resultType, adaptor.getInput(), adaptor.getLowBit());
+      int32_t inputWidth = inputType.getIntOrFloatBitWidth();
+      int32_t resultWidth = resultType.getIntOrFloatBitWidth();
+      int32_t high = low + resultWidth;
+
+      SmallVector<Value> toConcat;
+      if (low < 0)
+        toConcat.push_back(rewriter.create<hw::ConstantOp>(
+            op.getLoc(), APInt(std::min(-low, resultWidth), 0)));
+
+      if (low < inputWidth && high > 0) {
+        int32_t lowIdx = std::max(low, 0);
+        Value middle = rewriter.createOrFold<comb::ExtractOp>(
+            op.getLoc(),
+            rewriter.getIntegerType(
+                std::min(resultWidth, std::min(high, inputWidth) - lowIdx)),
+            adaptor.getInput(), lowIdx);
+        toConcat.push_back(middle);
+      }
+
+      int32_t diff = high - inputWidth;
+      if (diff > 0) {
+        Value val =
+            rewriter.create<hw::ConstantOp>(op.getLoc(), APInt(diff, 0));
+        toConcat.push_back(val);
+      }
+
+      Value concat =
+          rewriter.createOrFold<comb::ConcatOp>(op.getLoc(), toConcat);
+      rewriter.replaceOp(op, concat);
       return success();
     }
 
     if (auto arrTy = dyn_cast<hw::ArrayType>(inputType)) {
-      int64_t width = llvm::Log2_64_Ceil(arrTy.getNumElements());
-      Value idx = rewriter.create<hw::ConstantOp>(
-          op.getLoc(), rewriter.getIntegerType(width), adaptor.getLowBit());
-      if (isa<hw::ArrayType>(resultType)) {
-        rewriter.replaceOpWithNewOp<hw::ArraySliceOp>(op, resultType,
-                                                      adaptor.getInput(), idx);
+      int32_t width = llvm::Log2_64_Ceil(arrTy.getNumElements());
+      int32_t inputWidth = arrTy.getNumElements();
+
+      if (auto resArrTy = dyn_cast<hw::ArrayType>(resultType)) {
+        int32_t elementWidth = hw::getBitWidth(arrTy.getElementType());
+        if (elementWidth < 0)
+          return failure();
+
+        int32_t high = low + resArrTy.getNumElements();
+        int32_t resWidth = resArrTy.getNumElements();
+
+        SmallVector<Value> toConcat;
+        if (low < 0) {
+          Value val = rewriter.create<hw::ConstantOp>(
+              op.getLoc(),
+              APInt(std::min((-low) * elementWidth, resWidth * elementWidth),
+                    0));
+          Value res = rewriter.createOrFold<hw::BitcastOp>(
+              op.getLoc(), hw::ArrayType::get(arrTy.getElementType(), -low),
+              val);
+          toConcat.push_back(res);
+        }
+
+        if (low < inputWidth && high > 0) {
+          int32_t lowIdx = std::max(0, low);
+          Value lowIdxVal = rewriter.create<hw::ConstantOp>(
+              op.getLoc(), rewriter.getIntegerType(width), lowIdx);
+          Value middle = rewriter.createOrFold<hw::ArraySliceOp>(
+              op.getLoc(),
+              hw::ArrayType::get(
+                  arrTy.getElementType(),
+                  std::min(resWidth, std::min(inputWidth, high) - lowIdx)),
+              adaptor.getInput(), lowIdxVal);
+          toConcat.push_back(middle);
+        }
+
+        int32_t diff = high - inputWidth;
+        if (diff > 0) {
+          Value constZero = rewriter.create<hw::ConstantOp>(
+              op.getLoc(), APInt(diff * elementWidth, 0));
+          Value val = rewriter.create<hw::BitcastOp>(
+              op.getLoc(), hw::ArrayType::get(arrTy.getElementType(), diff),
+              constZero);
+          toConcat.push_back(val);
+        }
+
+        Value concat =
+            rewriter.createOrFold<hw::ArrayConcatOp>(op.getLoc(), toConcat);
+        rewriter.replaceOp(op, concat);
         return success();
       }
 
       // Otherwise, it has to be the array's element type
+      if (low < 0 || low >= inputWidth) {
+        int32_t bw = hw::getBitWidth(resultType);
+        if (bw < 0)
+          return failure();
+
+        Value val = rewriter.create<hw::ConstantOp>(op.getLoc(), APInt(bw, 0));
+        Value bitcast =
+            rewriter.createOrFold<hw::BitcastOp>(op.getLoc(), resultType, val);
+        rewriter.replaceOp(op, bitcast);
+        return success();
+      }
+
+      Value idx = rewriter.create<hw::ConstantOp>(
+          op.getLoc(), rewriter.getIntegerType(width), adaptor.getLowBit());
       rewriter.replaceOpWithNewOp<hw::ArrayGetOp>(op, adaptor.getInput(), idx);
       return success();
     }
@@ -898,6 +1094,10 @@ struct CaseXZEqOpConversion : public OpConversionPattern<SourceOp> {
   }
 };
 
+//===----------------------------------------------------------------------===//
+// Conversions
+//===----------------------------------------------------------------------===//
+
 struct ConversionOpConversion : public OpConversionPattern<ConversionOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -918,6 +1118,50 @@ struct ConversionOpConversion : public OpConversionPattern<ConversionOp> {
     Value result =
         rewriter.createOrFold<hw::BitcastOp>(loc, resultType, amount);
     rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
+struct TruncOpConversion : public OpConversionPattern<TruncOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(TruncOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOpWithNewOp<comb::ExtractOp>(op, adaptor.getInput(), 0,
+                                                 op.getType().getWidth());
+    return success();
+  }
+};
+
+struct ZExtOpConversion : public OpConversionPattern<ZExtOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(ZExtOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto targetWidth = op.getType().getWidth();
+    auto inputWidth = op.getInput().getType().getWidth();
+
+    auto zeroExt = rewriter.create<hw::ConstantOp>(
+        op.getLoc(), rewriter.getIntegerType(targetWidth - inputWidth), 0);
+
+    rewriter.replaceOpWithNewOp<comb::ConcatOp>(
+        op, ValueRange{zeroExt, adaptor.getInput()});
+    return success();
+  }
+};
+
+struct SExtOpConversion : public OpConversionPattern<SExtOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(SExtOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto type = typeConverter->convertType(op.getType());
+    auto value =
+        comb::createOrFoldSExt(op.getLoc(), adaptor.getInput(), type, rewriter);
+    rewriter.replaceOp(op, value);
     return success();
   }
 };
@@ -1057,6 +1301,84 @@ struct ShrOpConversion : public OpConversionPattern<ShrOp> {
   }
 };
 
+struct PowUOpConversion : public OpConversionPattern<PowUOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(PowUOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type resultType = typeConverter->convertType(op.getResult().getType());
+
+    Location loc = op.getLoc();
+    auto intType = cast<IntType>(op.getRhs().getType());
+
+    // transform a ** b into scf.for 0 to b step 1 { init *= a }, init = 1
+    Type integerType = rewriter.getIntegerType(intType.getWidth());
+    Value lowerBound = rewriter.create<hw::ConstantOp>(loc, integerType, 0);
+    Value upperBound =
+        rewriter.create<ConversionOp>(loc, integerType, op.getRhs());
+    Value step = rewriter.create<hw::ConstantOp>(loc, integerType, 1);
+
+    Value initVal = rewriter.create<hw::ConstantOp>(loc, resultType, 1);
+    Value lhsVal = rewriter.create<ConversionOp>(loc, resultType, op.getLhs());
+
+    auto forOp = rewriter.create<scf::ForOp>(
+        loc, lowerBound, upperBound, step, ValueRange(initVal),
+        [&](OpBuilder &builder, Location loc, Value i, ValueRange iterArgs) {
+          Value loopVar = iterArgs.front();
+          Value mul = rewriter.create<comb::MulOp>(loc, lhsVal, loopVar);
+          rewriter.create<scf::YieldOp>(loc, ValueRange(mul));
+        });
+
+    rewriter.replaceOp(op, forOp.getResult(0));
+
+    return success();
+  }
+};
+
+struct PowSOpConversion : public OpConversionPattern<PowSOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(PowSOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type resultType = typeConverter->convertType(op.getResult().getType());
+
+    Location loc = op.getLoc();
+    auto intType = cast<IntType>(op.getRhs().getType());
+    // transform a ** b into scf.for 0 to b step 1 { init *= a }, init = 1
+    Type integerType = rewriter.getIntegerType(intType.getWidth());
+    Value lhsVal = rewriter.create<ConversionOp>(loc, resultType, op.getLhs());
+    Value rhsVal = rewriter.create<ConversionOp>(loc, integerType, op.getRhs());
+    Value constZero = rewriter.create<hw::ConstantOp>(loc, integerType, 0);
+    Value constZeroResult = rewriter.create<hw::ConstantOp>(loc, resultType, 0);
+    Value isNegative = rewriter.create<comb::ICmpOp>(loc, ICmpPredicate::slt,
+                                                     rhsVal, constZero);
+
+    // if the exponent is negative, return 0
+    lhsVal =
+        rewriter.create<comb::MuxOp>(loc, isNegative, constZeroResult, lhsVal);
+    Value upperBound =
+        rewriter.create<comb::MuxOp>(loc, isNegative, constZero, rhsVal);
+
+    Value lowerBound = constZero;
+    Value step = rewriter.create<hw::ConstantOp>(loc, integerType, 1);
+    Value initVal = rewriter.create<hw::ConstantOp>(loc, resultType, 1);
+
+    auto forOp = rewriter.create<scf::ForOp>(
+        loc, lowerBound, upperBound, step, ValueRange(initVal),
+        [&](OpBuilder &builder, Location loc, Value i, ValueRange iterArgs) {
+          auto loopVar = iterArgs.front();
+          auto mul = rewriter.create<comb::MulOp>(loc, lhsVal, loopVar);
+          rewriter.create<scf::YieldOp>(loc, ValueRange(mul));
+        });
+
+    rewriter.replaceOp(op, forOp.getResult(0));
+
+    return success();
+  }
+};
+
 struct AShrOpConversion : public OpConversionPattern<AShrOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -1137,6 +1459,9 @@ struct ConditionalOpConversion : public OpConversionPattern<ConditionalOp> {
               !memOp.hasEffect<MemoryEffects::Free>())
             return WalkResult::advance();
 
+        if (operation->hasTrait<OpTrait::HasRecursiveMemoryEffects>())
+          return WalkResult::advance();
+
         return WalkResult::interrupt();
       });
       return !result.wasInterrupted();
@@ -1199,6 +1524,87 @@ struct InPlaceOpConversion : public OpConversionPattern<SourceOp> {
   }
 };
 
+template <typename MooreOpTy, typename VerifOpTy>
+struct AssertLikeOpConversion : public OpConversionPattern<MooreOpTy> {
+  using OpConversionPattern<MooreOpTy>::OpConversionPattern;
+  using OpAdaptor = typename MooreOpTy::Adaptor;
+
+  LogicalResult
+  matchAndRewrite(MooreOpTy op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    StringAttr label =
+        op.getLabel().has_value()
+            ? StringAttr::get(op->getContext(), op.getLabel().value())
+            : StringAttr::get(op->getContext());
+    rewriter.replaceOpWithNewOp<VerifOpTy>(op, adaptor.getCond(), mlir::Value(),
+                                           label);
+    return success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// Format String Conversion
+//===----------------------------------------------------------------------===//
+
+struct FormatLiteralOpConversion : public OpConversionPattern<FormatLiteralOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(FormatLiteralOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOpWithNewOp<sim::FormatLitOp>(op, adaptor.getLiteral());
+    return success();
+  }
+};
+
+struct FormatConcatOpConversion : public OpConversionPattern<FormatConcatOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(FormatConcatOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOpWithNewOp<sim::FormatStringConcatOp>(op,
+                                                           adaptor.getInputs());
+    return success();
+  }
+};
+
+struct FormatIntOpConversion : public OpConversionPattern<FormatIntOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(FormatIntOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    // TODO: These should honor the width, alignment, and padding.
+    switch (op.getFormat()) {
+    case IntFormat::Decimal:
+      rewriter.replaceOpWithNewOp<sim::FormatDecOp>(op, adaptor.getValue());
+      return success();
+    case IntFormat::Binary:
+      rewriter.replaceOpWithNewOp<sim::FormatBinOp>(op, adaptor.getValue());
+      return success();
+    case IntFormat::HexLower:
+    case IntFormat::HexUpper:
+      rewriter.replaceOpWithNewOp<sim::FormatHexOp>(op, adaptor.getValue());
+      return success();
+    default:
+      return rewriter.notifyMatchFailure(op, "unsupported int format");
+    }
+  }
+};
+
+struct DisplayBIOpConversion : public OpConversionPattern<DisplayBIOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(DisplayBIOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOpWithNewOp<sim::PrintFormattedProcOp>(
+        op, adaptor.getMessage());
+    return success();
+  }
+};
+
 } // namespace
 
 //===----------------------------------------------------------------------===//
@@ -1208,18 +1614,25 @@ struct InPlaceOpConversion : public OpConversionPattern<SourceOp> {
 static void populateLegality(ConversionTarget &target,
                              const TypeConverter &converter) {
   target.addIllegalDialect<MooreDialect>();
-  target.addLegalDialect<mlir::BuiltinDialect>();
+  target.addLegalDialect<comb::CombDialect>();
   target.addLegalDialect<hw::HWDialect>();
   target.addLegalDialect<llhd::LLHDDialect>();
-  target.addLegalDialect<comb::CombDialect>();
+  target.addLegalDialect<mlir::BuiltinDialect>();
+  target.addLegalDialect<sim::SimDialect>();
+  target.addLegalDialect<verif::VerifDialect>();
 
   target.addLegalOp<debug::ScopeOp>();
 
   target.addDynamicallyLegalOp<
-      cf::CondBranchOp, cf::BranchOp, scf::IfOp, scf::YieldOp, func::CallOp,
+      cf::CondBranchOp, cf::BranchOp, scf::YieldOp, func::CallOp,
       func::ReturnOp, UnrealizedConversionCastOp, hw::OutputOp, hw::InstanceOp,
       debug::ArrayOp, debug::StructOp, debug::VariableOp>(
       [&](Operation *op) { return converter.isLegal(op); });
+
+  target.addDynamicallyLegalOp<scf::IfOp, scf::ForOp, scf::ExecuteRegionOp,
+                               scf::WhileOp, scf::ForallOp>([&](Operation *op) {
+    return converter.isLegal(op) && !op->getParentOfType<llhd::ProcessOp>();
+  });
 
   target.addDynamicallyLegalOp<func::FuncOp>([&](func::FuncOp op) {
     return converter.isSignatureLegal(op.getFunctionType()) &&
@@ -1237,11 +1650,25 @@ static void populateTypeConversion(TypeConverter &typeConverter) {
     return IntegerType::get(type.getContext(), type.getWidth());
   });
 
+  typeConverter.addConversion([&](FormatStringType type) {
+    return sim::FormatStringType::get(type.getContext());
+  });
+
   typeConverter.addConversion([&](ArrayType type) -> std::optional<Type> {
     if (auto elementType = typeConverter.convertType(type.getElementType()))
       return hw::ArrayType::get(elementType, type.getSize());
     return {};
   });
+
+  // FIXME: Unpacked arrays support more element types than their packed
+  // variants, and as such, mapping them to hw::Array is somewhat naive. See
+  // also the analogous note below concerning unpacked struct type conversion.
+  typeConverter.addConversion(
+      [&](UnpackedArrayType type) -> std::optional<Type> {
+        if (auto elementType = typeConverter.convertType(type.getElementType()))
+          return hw::ArrayType::get(elementType, type.getSize());
+        return {};
+      });
 
   typeConverter.addConversion([&](StructType type) -> std::optional<Type> {
     SmallVector<hw::StructType::FieldInfo> fields;
@@ -1314,10 +1741,9 @@ static void populateTypeConversion(TypeConverter &typeConverter) {
 
   typeConverter.addTargetMaterialization(
       [&](mlir::OpBuilder &builder, mlir::Type resultType,
-          mlir::ValueRange inputs,
-          mlir::Location loc) -> std::optional<mlir::Value> {
+          mlir::ValueRange inputs, mlir::Location loc) -> mlir::Value {
         if (inputs.size() != 1 || !inputs[0])
-          return std::nullopt;
+          return Value();
         return builder
             .create<UnrealizedConversionCastOp>(loc, resultType, inputs[0])
             .getResult(0);
@@ -1325,10 +1751,9 @@ static void populateTypeConversion(TypeConverter &typeConverter) {
 
   typeConverter.addSourceMaterialization(
       [&](mlir::OpBuilder &builder, mlir::Type resultType,
-          mlir::ValueRange inputs,
-          mlir::Location loc) -> std::optional<mlir::Value> {
+          mlir::ValueRange inputs, mlir::Location loc) -> mlir::Value {
         if (inputs.size() != 1)
-          return std::nullopt;
+          return Value();
         return builder
             .create<UnrealizedConversionCastOp>(loc, resultType, inputs[0])
             ->getResult(0);
@@ -1342,14 +1767,21 @@ static void populateOpConversion(RewritePatternSet &patterns,
   patterns.add<
     // Patterns of declaration operations.
     VariableOpConversion,
+    NetOpConversion,
+
+    // Patterns for conversion operations.
+    ConversionOpConversion,
+    TruncOpConversion,
+    ZExtOpConversion,
+    SExtOpConversion,
 
     // Patterns of miscellaneous operations.
     ConstantOpConv, ConcatOpConversion, ReplicateOpConversion,
     ExtractOpConversion, DynExtractOpConversion, DynExtractRefOpConversion,
-    ConversionOpConversion, ReadOpConversion,
+    ReadOpConversion,
     StructExtractOpConversion, StructExtractRefOpConversion,
     ExtractRefOpConversion, StructCreateOpConversion, ConditionalOpConversion,
-    YieldOpConversion, OutputOpConversion,
+    YieldOpConversion, OutputOpConversion, StringConstantOpConv,
 
     // Patterns of unary operations.
     ReduceAndOpConversion, ReduceOrOpConversion, ReduceXorOpConversion,
@@ -1366,6 +1798,9 @@ static void populateOpConversion(RewritePatternSet &patterns,
     BinaryOpConversion<AndOp, comb::AndOp>,
     BinaryOpConversion<OrOp, comb::OrOp>,
     BinaryOpConversion<XorOp, comb::XorOp>,
+
+    // Patterns of power operations.
+    PowUOpConversion, PowSOpConversion,
 
     // Patterns of relational operations.
     ICmpOpConversion<UltOp, ICmpPredicate::ult>,
@@ -1384,7 +1819,7 @@ static void populateOpConversion(RewritePatternSet &patterns,
     ICmpOpConversion<WildcardNeOp, ICmpPredicate::wne>,
     CaseXZEqOpConversion<CaseZEqOp, true>,
     CaseXZEqOpConversion<CaseXZEqOp, false>,
-    
+
     // Patterns of structural operations.
     SVModuleOpConversion, InstanceOpConversion, ProcedureOpConversion, WaitEventOpConversion,
 
@@ -1405,14 +1840,27 @@ static void populateOpConversion(RewritePatternSet &patterns,
     CallOpConversion, UnrealizedConversionCastConversion,
     InPlaceOpConversion<debug::ArrayOp>,
     InPlaceOpConversion<debug::StructOp>,
-    InPlaceOpConversion<debug::VariableOp>
+    InPlaceOpConversion<debug::VariableOp>,
+
+    // Patterns of assert-like operations
+    AssertLikeOpConversion<AssertOp, verif::AssertOp>,
+    AssertLikeOpConversion<AssumeOp, verif::AssumeOp>,
+    AssertLikeOpConversion<CoverOp, verif::CoverOp>,
+
+    // Format strings.
+    FormatLiteralOpConversion,
+    FormatConcatOpConversion,
+    FormatIntOpConversion,
+    DisplayBIOpConversion
   >(typeConverter, context);
   // clang-format on
+
   mlir::populateAnyFunctionOpInterfaceTypeConversionPattern(patterns,
                                                             typeConverter);
-
   hw::populateHWModuleLikeTypeConversionPattern(
       hw::HWModuleOp::getOperationName(), patterns, typeConverter);
+  populateSCFToControlFlowConversionPatterns(patterns);
+  populateArithToCombPatterns(patterns, typeConverter);
 }
 
 //===----------------------------------------------------------------------===//

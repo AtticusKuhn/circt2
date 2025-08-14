@@ -47,7 +47,6 @@ class ESIType:
     """Does this type support host communication via Python? Returns either
     '(True, None)' if it is, or '(False, reason)' if it is not."""
 
-    print(f"supports_host: {self.cpp_type} {type(self)}")
     if self.bit_width % 8 != 0:
       return (False, "runtime only supports types with multiple of 8 bits")
     return (True, None)
@@ -305,6 +304,9 @@ class Port:
 
     self.cpp_port.connect(buffer_size)
     return self
+
+  def disconnect(self):
+    self.cpp_port.disconnect()
 
 
 class WritePort(Port):

@@ -19,7 +19,7 @@ circuit Foo: %[[
   ; should be output in the testbench directory too.
   module VerificationHelper:
     wire w : UInt<1>
-    w is invalid
+    invalidate w
 
   ; Although the Component Bar is only instantiated by testbench Foo, since Bar
   ; is public, it remains in the default build directory.
@@ -132,7 +132,7 @@ circuit TestHarness:
   ; CHECK:   `ifndef SYNTHESIS
   ; CHECK:     always @(posedge clock) begin
   ; CHECK:       if ((`PRINTF_COND_) & reset)
-  ; CHECK:         $fwrite(32'h80000002, "The last PC was: %x", dut_trace);
+  ; CHECK:         $fwrite(`PRINTF_FD_, "The last PC was: %x", dut_trace);
   ; CHECK:     end // always @(posedge)
   ; CHECK:   `endif // not def SYNTHESIS
   ; CHECK: endmodule

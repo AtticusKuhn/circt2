@@ -10,14 +10,16 @@ set(CIRCT_INTEGRATION_TEST_DEPENDS
   circt-rtl-sim
   circt-lec
   circt-bmc
+  circt-test
+  circt-test-runners
   firtool
   hlstool
-  ibistool
+  kanagawatool
   handshake-runner
   )
 
 if (MLIR_ENABLE_EXECUTION_ENGINE)
-  list(APPEND CIRCT_INTEGRATION_TEST_DEPENDS mlir-cpu-runner)
+  list(APPEND CIRCT_INTEGRATION_TEST_DEPENDS mlir-runner)
 endif()
 
 # If Python bindings are available to build then enable the tests.
@@ -44,11 +46,14 @@ if (ESI_RUNTIME)
   endif()
 endif()
 
+get_target_property(ESI_PrimsDir ESIPrimitives SOURCE_DIR)
+set(ESI_Prims "${ESI_PrimsDir}/ESIPrimitives.sv")
+
 set(CIRCT_INTEGRATION_TIMEOUT 60) # Set a 60s timeout on individual tests.
 configure_lit_site_cfg(
   ${CMAKE_CURRENT_SOURCE_DIR}/lit.site.cfg.py.in
   ${CMAKE_CURRENT_BINARY_DIR}/lit.site.cfg.py
-  INTEGRATION_CONFIG
+  MAIN_CONFIG
   ${CMAKE_CURRENT_SOURCE_DIR}/lit.cfg.py
 )
 

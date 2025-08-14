@@ -118,9 +118,6 @@ std::unique_ptr<mlir::Pass> createDedupPass();
 
 std::unique_ptr<mlir::Pass> createEliminateWiresPass();
 
-std::unique_ptr<mlir::Pass>
-createEmitOMIRPass(mlir::StringRef outputFilename = "");
-
 std::unique_ptr<mlir::Pass> createLowerMatchesPass();
 
 std::unique_ptr<mlir::Pass> createLowerSignaturesPass();
@@ -139,8 +136,6 @@ std::unique_ptr<mlir::Pass> createLowerMemoryPass();
 
 std::unique_ptr<mlir::Pass>
 createMemToRegOfVecPass(bool replSeqMem = false, bool ignoreReadEnable = false);
-
-std::unique_ptr<mlir::Pass> createPrefixModulesPass();
 
 std::unique_ptr<mlir::Pass> createFIRRTLFieldSourcePass();
 
@@ -195,6 +190,8 @@ std::unique_ptr<mlir::Pass> createLayerMergePass();
 
 std::unique_ptr<mlir::Pass> createLayerSinkPass();
 
+std::unique_ptr<mlir::Pass> createAdvancedLayerSinkPass();
+
 std::unique_ptr<mlir::Pass> createMaterializeDebugInfoPass();
 
 std::unique_ptr<mlir::Pass> createLintingPass();
@@ -203,7 +200,8 @@ std::unique_ptr<mlir::Pass> createProbesToSignalsPass();
 
 std::unique_ptr<mlir::Pass> createSpecializeLayersPass();
 
-std::unique_ptr<mlir::Pass> createSpecializeOptionPass();
+std::unique_ptr<mlir::Pass>
+createSpecializeOptionPass(bool selectDefaultInstanceChoice = false);
 
 std::unique_ptr<mlir::Pass> createCreateCompanionAssume();
 

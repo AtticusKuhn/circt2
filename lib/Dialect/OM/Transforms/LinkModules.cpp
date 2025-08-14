@@ -13,6 +13,7 @@
 #include "circt/Dialect/OM/OMOps.h"
 #include "circt/Dialect/OM/OMPasses.h"
 #include "circt/Support/Namespace.h"
+#include "mlir/IR/Block.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/SymbolTable.h"
@@ -39,7 +40,9 @@ using SymMappingTy =
     llvm::DenseMap<std::pair<ModuleOp, StringAttr>, StringAttr>;
 
 struct ModuleInfo {
-  ModuleInfo(mlir::ModuleOp module) : module(module) {}
+  ModuleInfo(mlir::ModuleOp module) : module(module) {
+    block = std::make_unique<Block>();
+  }
 
   // Populate `symbolToClasses`.
   LogicalResult initialize();
@@ -52,6 +55,9 @@ struct ModuleInfo {
 
   // A target module.
   ModuleOp module;
+
+  // A block to store original operations.
+  std::unique_ptr<Block> block;
 };
 
 struct LinkModulesPass
@@ -65,8 +71,10 @@ LogicalResult ModuleInfo::initialize() {
   for (auto &op : llvm::make_early_inc_range(module.getOps())) {
     if (auto classLike = dyn_cast<ClassLike>(op))
       symbolToClasses.insert({classLike.getSymNameAttr(), classLike});
-    else
-      op.erase();
+    else {
+      // Keep the op.
+      op.moveBefore(block.get(), block->end());
+    }
   }
   return success();
 }
@@ -98,6 +106,7 @@ void ModuleInfo::postProcess(const SymMappingTy &symMapping) {
       auto it = symMapping.find({module, classOp.getNameAttr()});
       if (it != symMapping.end())
         classOp.setSymNameAttr(it->second);
+      classOp.replaceFieldTypes(replacer);
     } else if (auto objectOp = dyn_cast<ObjectOp>(op)) {
       // Update its class name if changed..
       auto it = symMapping.find({module, objectOp.getClassNameAttr()});
@@ -170,10 +179,6 @@ static FailureOr<bool> resolveClasses(StringAttr name,
     return diag;
   };
 
-  llvm::MapVector<StringAttr, Type> classFields;
-  for (auto fieldOp : classOp.getOps<om::ClassFieldOp>())
-    classFields.insert({fieldOp.getNameAttr(), fieldOp.getType()});
-
   for (auto op : classes) {
     if (op == classOp)
       continue;
@@ -193,25 +198,32 @@ static FailureOr<bool> resolveClasses(StringAttr name,
     }
     // Check declared fields.
     llvm::DenseSet<StringAttr> declaredFields;
-    for (auto fieldOp : op.getBodyBlock()->getOps<om::ClassExternFieldOp>()) {
-      auto it = classFields.find(fieldOp.getNameAttr());
+
+    for (auto nameAttr : op.getFieldNames()) {
+      StringAttr name = cast<StringAttr>(nameAttr);
+      std::optional<Type> opTypeOpt = op.getFieldType(name);
+
+      if (!opTypeOpt.has_value())
+        return emitError(op) << " no type for field " << name;
+      Type opType = opTypeOpt.value();
+
+      std::optional<Type> classTypeOpt = classOp.getFieldType(name);
 
       // Field not found in its definition.
-      if (it == classFields.end())
-        return emitError(op)
-               << "declaration has a field " << fieldOp.getNameAttr()
-               << " but not found in its definition";
+      if (!classTypeOpt.has_value())
+        return emitError(op) << "declaration has a field " << name
+                             << " but not found in its definition";
+      Type classType = classTypeOpt.value();
 
-      if (it->second != fieldOp.getType())
+      if (classType != opType)
         return emitError(op)
-               << "declaration has a field " << fieldOp.getNameAttr()
-               << " but types don't match, " << it->second << " vs "
-               << fieldOp.getType();
-      declaredFields.insert(fieldOp.getNameAttr());
+               << "declaration has a field " << name
+               << " but types don't match, " << classType << " vs " << opType;
+      declaredFields.insert(name);
     }
 
-    for (auto [fieldName, _] : classFields)
-      if (!declaredFields.count(fieldName))
+    for (auto fieldName : classOp.getFieldNames())
+      if (!declaredFields.count(cast<StringAttr>(fieldName)))
         return emitError(op) << "definition has a field " << fieldName
                              << " but not found in this declaration";
   }
@@ -289,11 +301,13 @@ void LinkModulesPass::runOnOperation() {
 
   // Finally move operations to the toplevel module.
   auto *block = toplevelModule.getBody();
-  for (auto info : modules) {
+  for (auto &info : modules) {
     block->getOperations().splice(block->end(),
                                   info.module.getBody()->getOperations());
-    // Erase the module.
-    info.module.erase();
+    // Restore non-OM operations.
+    assert(info.module.getBody()->empty());
+    info.module.getBody()->getOperations().splice(
+        info.module.getBody()->begin(), info.block->getOperations());
   }
 }
 

@@ -25,8 +25,9 @@ using llvm::MapVector;
 
 static bool isArcBreakingOp(Operation *op) {
   return op->hasTrait<OpTrait::ConstantLike>() ||
-         isa<hw::InstanceOp, seq::CompRegOp, MemoryOp, ClockedOpInterface,
-             seq::InitialOp, seq::ClockGateOp, sim::DPICallOp>(op) ||
+         isa<hw::InstanceOp, seq::CompRegOp, MemoryOp, MemoryReadPortOp,
+             ClockedOpInterface, seq::InitialOp, seq::ClockGateOp,
+             sim::DPICallOp>(op) ||
          op->getNumResults() > 1;
 }
 
@@ -35,12 +36,11 @@ static LogicalResult convertInitialValue(seq::CompRegOp reg,
   if (!reg.getInitialValue())
     return values.push_back({}), success();
 
-  // unrealized_conversion_cast to normal type
+  // Use from_immutable cast to convert the seq.immutable type to the reg's
+  // type.
   OpBuilder builder(reg);
-  auto init = builder
-                  .create<mlir::UnrealizedConversionCastOp>(
-                      reg.getLoc(), reg.getType(), reg.getInitialValue())
-                  .getResult(0);
+  auto init = builder.create<seq::FromImmutableOp>(reg.getLoc(), reg.getType(),
+                                                   reg.getInitialValue());
 
   values.push_back(init);
   return success();
@@ -357,7 +357,7 @@ LogicalResult Converter::absorbRegs(HWModuleOp module) {
       rewriter.setInsertionPoint(callOp);
       arc = rewriter.replaceOpWithNewOp<StateOp>(
           callOp.getOperation(),
-          callOp.getCallableForCallee().get<SymbolRefAttr>(),
+          llvm::cast<SymbolRefAttr>(callOp.getCallableForCallee()),
           callOp->getResultTypes(), clock, Value{}, 1, callOp.getArgOperands());
     }
 

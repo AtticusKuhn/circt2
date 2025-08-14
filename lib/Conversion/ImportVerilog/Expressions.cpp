@@ -69,6 +69,28 @@ struct RvalueExprVisitor {
     return {};
   }
 
+  // Handle hierarchical values, such as `x = Top.sub.var`.
+  Value visit(const slang::ast::HierarchicalValueExpression &expr) {
+    auto hierLoc = context.convertLocation(expr.symbol.location);
+    if (auto value = context.valueSymbols.lookup(&expr.symbol)) {
+      if (isa<moore::RefType>(value.getType())) {
+        auto readOp = builder.create<moore::ReadOp>(hierLoc, value);
+        if (context.rvalueReadCallback)
+          context.rvalueReadCallback(readOp);
+        value = readOp.getResult();
+      }
+      return value;
+    }
+
+    // Emit an error for those hierarchical values not recorded in the
+    // `valueSymbols`.
+    auto d = mlir::emitError(loc, "unknown hierarchical name `")
+             << expr.symbol.name << "`";
+    d.attachNote(hierLoc) << "no rvalue generated for "
+                          << slang::ast::toString(expr.symbol.kind);
+    return {};
+  }
+
   // Handle type conversions (explicit and implicit).
   Value visit(const slang::ast::ConversionExpression &expr) {
     auto type = context.convertType(*expr.type);
@@ -408,23 +430,55 @@ struct RvalueExprVisitor {
     return builder.create<moore::ReplicateOp>(loc, type, value);
   }
 
+  Value getSelectIndex(Value index, const slang::ConstantRange &range) const {
+    auto indexType = cast<moore::UnpackedType>(index.getType());
+    auto bw = std::max(llvm::Log2_32_Ceil(std::max(std::abs(range.lower()),
+                                                   std::abs(range.upper()))),
+                       indexType.getBitSize().value());
+    auto intType =
+        moore::IntType::get(index.getContext(), bw, indexType.getDomain());
+
+    if (range.isLittleEndian()) {
+      if (range.lower() == 0)
+        return index;
+
+      Value newIndex =
+          builder.createOrFold<moore::ConversionOp>(loc, intType, index);
+      Value offset = builder.create<moore::ConstantOp>(
+          loc, intType, range.lower(), /*isSigned = */ range.lower() < 0);
+      return builder.createOrFold<moore::SubOp>(loc, newIndex, offset);
+    }
+
+    if (range.upper() == 0)
+      return builder.createOrFold<moore::NegOp>(loc, index);
+
+    Value newIndex =
+        builder.createOrFold<moore::ConversionOp>(loc, intType, index);
+    Value offset = builder.create<moore::ConstantOp>(
+        loc, intType, range.upper(), /* isSigned = */ range.upper() < 0);
+    return builder.createOrFold<moore::SubOp>(loc, offset, newIndex);
+  }
+
   // Handle single bit selections.
   Value visit(const slang::ast::ElementSelectExpression &expr) {
     auto type = context.convertType(*expr.type);
     auto value = context.convertRvalueExpression(expr.value());
     if (!type || !value)
       return {};
+    auto range = expr.value().type->getFixedRange();
     if (auto *constValue = expr.selector().constant) {
       assert(!constValue->hasUnknown());
       assert(constValue->size() <= 32);
 
       auto lowBit = constValue->integer().as<uint32_t>().value();
-      return builder.create<moore::ExtractOp>(loc, type, value, lowBit);
+      return builder.create<moore::ExtractOp>(loc, type, value,
+                                              range.translateIndex(lowBit));
     }
     auto lowBit = context.convertRvalueExpression(expr.selector());
     if (!lowBit)
       return {};
-    return builder.create<moore::DynExtractOp>(loc, type, value, lowBit);
+    return builder.create<moore::DynExtractOp>(loc, type, value,
+                                               getSelectIndex(lowBit, range));
   }
 
   // Handle range bits selections.
@@ -476,8 +530,8 @@ struct RvalueExprVisitor {
                                            subtrahendType.getDomain());
         auto sliceWidth =
             expr.right().constant->integer().as<uint32_t>().value() - 1;
-        auto minuend =
-            builder.create<moore::ConstantOp>(loc, intType, sliceWidth);
+        auto minuend = builder.create<moore::ConstantOp>(
+            loc, intType, sliceWidth, expr.left().type->isSigned());
         dynLowBit = builder.create<moore::SubOp>(loc, subtrahend, minuend);
       }
     } else {
@@ -487,9 +541,12 @@ struct RvalueExprVisitor {
       else
         dynLowBit = context.convertRvalueExpression(expr.left());
     }
+    auto range = expr.value().type->getFixedRange();
     if (leftConst && rightConst)
-      return builder.create<moore::ExtractOp>(loc, type, value, constLowBit);
-    return builder.create<moore::DynExtractOp>(loc, type, value, dynLowBit);
+      return builder.create<moore::ExtractOp>(
+          loc, type, value, range.translateIndex(constLowBit));
+    return builder.create<moore::DynExtractOp>(
+        loc, type, value, getSelectIndex(dynLowBit, range));
   }
 
   Value visit(const slang::ast::MemberAccessExpression &expr) {
@@ -610,20 +667,16 @@ struct RvalueExprVisitor {
 
     // Handle left expression.
     builder.setInsertionPointToStart(&trueBlock);
-    auto trueValue = context.convertRvalueExpression(expr.left());
+    auto trueValue = context.convertRvalueExpression(expr.left(), type);
     if (!trueValue)
       return {};
-    if (trueValue.getType() != type)
-      trueValue = builder.create<moore::ConversionOp>(loc, type, trueValue);
     builder.create<moore::YieldOp>(loc, trueValue);
 
     // Handle right expression.
     builder.setInsertionPointToStart(&falseBlock);
-    auto falseValue = context.convertRvalueExpression(expr.right());
+    auto falseValue = context.convertRvalueExpression(expr.right(), type);
     if (!falseValue)
       return {};
-    if (falseValue.getType() != type)
-      falseValue = builder.create<moore::ConversionOp>(loc, type, falseValue);
     builder.create<moore::YieldOp>(loc, falseValue);
 
     return conditionalOp.getResult();
@@ -699,15 +752,15 @@ struct RvalueExprVisitor {
     const auto &subroutine = *info.subroutine;
     auto args = expr.arguments();
 
-    if (subroutine.name == "$signed" || subroutine.name == "$unsigned")
-      return context.convertRvalueExpression(*args[0]);
-
-    if (subroutine.name == "$clog2") {
-      auto value = context.convertToSimpleBitVector(
-          context.convertRvalueExpression(*args[0]));
+    if (args.size() == 1) {
+      auto value = context.convertRvalueExpression(*args[0]);
       if (!value)
         return {};
-      return builder.create<moore::Clog2BIOp>(loc, value);
+      auto result = context.convertSystemCallArity1(subroutine, loc, value);
+      if (failed(result))
+        return {};
+      if (*result)
+        return *result;
     }
 
     mlir::emitError(loc) << "unsupported system call `" << subroutine.name
@@ -719,6 +772,12 @@ struct RvalueExprVisitor {
   Value visit(const slang::ast::StringLiteral &expr) {
     auto type = context.convertType(*expr.type);
     return builder.create<moore::StringConstantOp>(loc, type, expr.getValue());
+  }
+
+  /// Handle real literals.
+  Value visit(const slang::ast::RealLiteral &expr) {
+    return builder.create<moore::RealLiteralOp>(
+        loc, builder.getF64FloatAttr(expr.getValue()));
   }
 
   /// Handle assignment patterns.
@@ -791,6 +850,76 @@ struct RvalueExprVisitor {
     return visitAssignmentPattern(expr, *count);
   }
 
+  Value visit(const slang::ast::StreamingConcatenationExpression &expr) {
+    SmallVector<Value> operands;
+    for (auto stream : expr.streams()) {
+      auto operandLoc = context.convertLocation(stream.operand->sourceRange);
+      if (!stream.constantWithWidth.has_value() && stream.withExpr) {
+        mlir::emitError(operandLoc)
+            << "Moore only support streaming "
+               "concatenation with fixed size 'with expression'";
+        return {};
+      }
+      Value value;
+      if (stream.constantWithWidth.has_value()) {
+        value = context.convertRvalueExpression(*stream.withExpr);
+        auto type = cast<moore::UnpackedType>(value.getType());
+        auto intType = moore::IntType::get(
+            context.getContext(), type.getBitSize().value(), type.getDomain());
+        // Do not care if it's signed, because we will not do expansion.
+        value = context.materializeConversion(intType, value, false, loc);
+      } else {
+        value = context.convertRvalueExpression(*stream.operand);
+      }
+
+      if (!value)
+        return {};
+      value = context.convertToSimpleBitVector(value);
+      if (!value) {
+        return {};
+      }
+      operands.push_back(value);
+    }
+    Value value;
+
+    if (operands.size() == 1) {
+      // There must be at least one element, otherwise slang will report an
+      // error.
+      value = operands.front();
+    } else {
+      value = builder.create<moore::ConcatOp>(loc, operands).getResult();
+    }
+
+    if (expr.sliceSize == 0) {
+      return value;
+    }
+
+    auto type = cast<moore::IntType>(value.getType());
+    SmallVector<Value> slicedOperands;
+    auto iterMax = type.getWidth() / expr.sliceSize;
+    auto remainSize = type.getWidth() % expr.sliceSize;
+
+    for (size_t i = 0; i < iterMax; i++) {
+      auto extractResultType = moore::IntType::get(
+          context.getContext(), expr.sliceSize, type.getDomain());
+
+      auto extracted = builder.create<moore::ExtractOp>(
+          loc, extractResultType, value, i * expr.sliceSize);
+      slicedOperands.push_back(extracted);
+    }
+    // Handle other wire
+    if (remainSize) {
+      auto extractResultType = moore::IntType::get(
+          context.getContext(), remainSize, type.getDomain());
+
+      auto extracted = builder.create<moore::ExtractOp>(
+          loc, extractResultType, value, iterMax * expr.sliceSize);
+      slicedOperands.push_back(extracted);
+    }
+
+    return builder.create<moore::ConcatOp>(loc, slicedOperands);
+  }
+
   /// Emit an error for all other expressions.
   template <typename T>
   Value visit(T &&node) {
@@ -820,6 +949,20 @@ struct LvalueExprVisitor {
     if (auto value = context.valueSymbols.lookup(&expr.symbol))
       return value;
     auto d = mlir::emitError(loc, "unknown name `") << expr.symbol.name << "`";
+    d.attachNote(context.convertLocation(expr.symbol.location))
+        << "no lvalue generated for " << slang::ast::toString(expr.symbol.kind);
+    return {};
+  }
+
+  // Handle hierarchical values, such as `Top.sub.var = x`.
+  Value visit(const slang::ast::HierarchicalValueExpression &expr) {
+    if (auto value = context.valueSymbols.lookup(&expr.symbol))
+      return value;
+
+    // Emit an error for those hierarchical values not recorded in the
+    // `valueSymbols`.
+    auto d = mlir::emitError(loc, "unknown hierarchical name `")
+             << expr.symbol.name << "`";
     d.attachNote(context.convertLocation(expr.symbol.location))
         << "no lvalue generated for " << slang::ast::toString(expr.symbol.kind);
     return {};
@@ -929,6 +1072,75 @@ struct LvalueExprVisitor {
         dynLowBit);
   }
 
+  Value visit(const slang::ast::StreamingConcatenationExpression &expr) {
+    SmallVector<Value> operands;
+    for (auto stream : expr.streams()) {
+      auto operandLoc = context.convertLocation(stream.operand->sourceRange);
+      if (!stream.constantWithWidth.has_value() && stream.withExpr) {
+        mlir::emitError(operandLoc)
+            << "Moore only support streaming "
+               "concatenation with fixed size 'with expression'";
+        return {};
+      }
+      Value value;
+      if (stream.constantWithWidth.has_value()) {
+        value = context.convertLvalueExpression(*stream.withExpr);
+        auto type = cast<moore::UnpackedType>(
+            cast<moore::RefType>(value.getType()).getNestedType());
+        auto intType = moore::RefType::get(moore::IntType::get(
+            context.getContext(), type.getBitSize().value(), type.getDomain()));
+        // Do not care if it's signed, because we will not do expansion.
+        value = context.materializeConversion(intType, value, false, loc);
+      } else {
+        value = context.convertLvalueExpression(*stream.operand);
+      }
+
+      if (!value)
+        return {};
+      operands.push_back(value);
+    }
+    Value value;
+    if (operands.size() == 1) {
+      // There must be at least one element, otherwise slang will report an
+      // error.
+      value = operands.front();
+    } else {
+      value = builder.create<moore::ConcatRefOp>(loc, operands).getResult();
+    }
+
+    if (expr.sliceSize == 0) {
+      return value;
+    }
+
+    auto type = cast<moore::IntType>(
+        cast<moore::RefType>(value.getType()).getNestedType());
+    SmallVector<Value> slicedOperands;
+    auto widthSum = type.getWidth();
+    auto domain = type.getDomain();
+    auto iterMax = widthSum / expr.sliceSize;
+    auto remainSize = widthSum % expr.sliceSize;
+
+    for (size_t i = 0; i < iterMax; i++) {
+      auto extractResultType = moore::RefType::get(
+          moore::IntType::get(context.getContext(), expr.sliceSize, domain));
+
+      auto extracted = builder.create<moore::ExtractRefOp>(
+          loc, extractResultType, value, i * expr.sliceSize);
+      slicedOperands.push_back(extracted);
+    }
+    // Handle other wire
+    if (remainSize) {
+      auto extractResultType = moore::RefType::get(
+          moore::IntType::get(context.getContext(), remainSize, domain));
+
+      auto extracted = builder.create<moore::ExtractRefOp>(
+          loc, extractResultType, value, iterMax * expr.sliceSize);
+      slicedOperands.push_back(extracted);
+    }
+
+    return builder.create<moore::ConcatRefOp>(loc, slicedOperands);
+  }
+
   Value visit(const slang::ast::MemberAccessExpression &expr) {
     auto type = context.convertType(*expr.type);
     auto valueType = expr.value().type;
@@ -967,8 +1179,9 @@ Value Context::convertRvalueExpression(const slang::ast::Expression &expr,
                                        Type requiredType) {
   auto loc = convertLocation(expr.sourceRange);
   auto value = expr.visit(RvalueExprVisitor(*this, loc));
-  if (value && requiredType && value.getType() != requiredType)
-    value = builder.create<moore::ConversionOp>(loc, requiredType, value);
+  if (value && requiredType)
+    value =
+        materializeConversion(requiredType, value, expr.type->isSigned(), loc);
   return value;
 }
 
@@ -1063,4 +1276,137 @@ Value Context::convertToSimpleBitVector(Value value) {
   mlir::emitError(value.getLoc()) << "expression of type " << value.getType()
                                   << " cannot be cast to a simple bit vector";
   return {};
+}
+
+Value Context::materializeConversion(Type type, Value value, bool isSigned,
+                                     Location loc) {
+  if (type == value.getType())
+    return value;
+  auto dstPacked = dyn_cast<moore::PackedType>(type);
+  auto srcPacked = dyn_cast<moore::PackedType>(value.getType());
+
+  // Resize the value if needed.
+  if (dstPacked && srcPacked && dstPacked.getBitSize() &&
+      srcPacked.getBitSize() &&
+      *dstPacked.getBitSize() != *srcPacked.getBitSize()) {
+    auto dstWidth = *dstPacked.getBitSize();
+    auto srcWidth = *srcPacked.getBitSize();
+
+    // Convert the value to a simple bit vector which we can extend or truncate.
+    auto srcWidthType = moore::IntType::get(value.getContext(), srcWidth,
+                                            srcPacked.getDomain());
+    if (value.getType() != srcWidthType)
+      value = builder.create<moore::ConversionOp>(value.getLoc(), srcWidthType,
+                                                  value);
+
+    // Create truncation or sign/zero extension ops depending on the source and
+    // destination width.
+    auto dstWidthType = moore::IntType::get(value.getContext(), dstWidth,
+                                            srcPacked.getDomain());
+    if (dstWidth < srcWidth) {
+      value = builder.create<moore::TruncOp>(loc, dstWidthType, value);
+    } else if (dstWidth > srcWidth) {
+      if (isSigned)
+        value = builder.create<moore::SExtOp>(loc, dstWidthType, value);
+      else
+        value = builder.create<moore::ZExtOp>(loc, dstWidthType, value);
+    }
+  }
+
+  if (value.getType() != type)
+    value = builder.create<moore::ConversionOp>(loc, type, value);
+  return value;
+}
+
+FailureOr<Value>
+Context::convertSystemCallArity1(const slang::ast::SystemSubroutine &subroutine,
+                                 Location loc, Value value) {
+  auto systemCallRes =
+      llvm::StringSwitch<std::function<FailureOr<Value>()>>(subroutine.name)
+          // Signed and unsigned system functions.
+          .Case("$signed", [&]() { return value; })
+          .Case("$unsigned", [&]() { return value; })
+
+          // Math functions in SystemVerilog.
+          .Case("$clog2",
+                [&]() -> FailureOr<Value> {
+                  value = convertToSimpleBitVector(value);
+                  if (!value)
+                    return failure();
+                  return (Value)builder.create<moore::Clog2BIOp>(loc, value);
+                })
+          .Case("$ln",
+                [&]() -> Value {
+                  return builder.create<moore::LnBIOp>(loc, value);
+                })
+          .Case("$log10",
+                [&]() -> Value {
+                  return builder.create<moore::Log10BIOp>(loc, value);
+                })
+          .Case("$sin",
+                [&]() -> Value {
+                  return builder.create<moore::SinBIOp>(loc, value);
+                })
+          .Case("$cos",
+                [&]() -> Value {
+                  return builder.create<moore::CosBIOp>(loc, value);
+                })
+          .Case("$tan",
+                [&]() -> Value {
+                  return builder.create<moore::TanBIOp>(loc, value);
+                })
+          .Case("$exp",
+                [&]() -> Value {
+                  return builder.create<moore::ExpBIOp>(loc, value);
+                })
+          .Case("$sqrt",
+                [&]() -> Value {
+                  return builder.create<moore::SqrtBIOp>(loc, value);
+                })
+          .Case("$floor",
+                [&]() -> Value {
+                  return builder.create<moore::FloorBIOp>(loc, value);
+                })
+          .Case("$ceil",
+                [&]() -> Value {
+                  return builder.create<moore::CeilBIOp>(loc, value);
+                })
+          .Case("$asin",
+                [&]() -> Value {
+                  return builder.create<moore::AsinBIOp>(loc, value);
+                })
+          .Case("$acos",
+                [&]() -> Value {
+                  return builder.create<moore::AcosBIOp>(loc, value);
+                })
+          .Case("$atan",
+                [&]() -> Value {
+                  return builder.create<moore::AtanBIOp>(loc, value);
+                })
+          .Case("$sinh",
+                [&]() -> Value {
+                  return builder.create<moore::SinhBIOp>(loc, value);
+                })
+          .Case("$cosh",
+                [&]() -> Value {
+                  return builder.create<moore::CoshBIOp>(loc, value);
+                })
+          .Case("$tanh",
+                [&]() -> Value {
+                  return builder.create<moore::TanhBIOp>(loc, value);
+                })
+          .Case("$asinh",
+                [&]() -> Value {
+                  return builder.create<moore::AsinhBIOp>(loc, value);
+                })
+          .Case("$acosh",
+                [&]() -> Value {
+                  return builder.create<moore::AcoshBIOp>(loc, value);
+                })
+          .Case("$atanh",
+                [&]() -> Value {
+                  return builder.create<moore::AtanhBIOp>(loc, value);
+                })
+          .Default([&]() -> Value { return {}; });
+  return systemCallRes();
 }
